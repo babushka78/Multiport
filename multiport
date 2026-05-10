@@ -1,0 +1,685 @@
+#!/usr/bin/env python3.10
+import os, re, time, json, threading, subprocess, socketserver, serial, configparser, shutil
+from datetime import datetime
+from flask import Flask, jsonify, render_template_string, request
+import netifaces
+
+socketserver.TCPServer.allow_reuse_address = True
+app = Flask(__name__)
+
+DATA_FILE = os.path.expanduser('~/meshtastic_output.log')
+RNODE_HOST = '192.168.1.132'
+PORT = 5002
+RN_PATH = '/home/alex/.local/bin/rnstatus'
+MESHTASTIC_BIN = '/home/alex/.local/bin/meshtastic'
+REBOOT_TOKEN = os.environ.get('REBOOT_TOKEN', 'my_secret_reboot_token')
+RNODE_PORT = os.environ.get('RNODE_PORT', '/dev/rnode')
+RNODE_BAUD = 115200
+RNODE_CONFIG = os.path.expanduser('~/.reticulum/config')
+TRANSPORT_SERVICE = 'rnode-transport'
+
+data = {'messages':[],'nodes':{},'battery':'?','voltage':'?','status':'⏳ Загрузка...',
+        'network':{'wifi_ip':'—','vpn_ip':'—'},
+        'rnode':{'status':'unknown','ping':'—','last_check':'—'},
+        'rnode_interfaces':[], 'rnode_totals':{},
+        'local_node':{'name':'Loko','id':'0a675cfe','last_seen':datetime.now().strftime('%H:%M')}}
+data_lock = threading.Lock()
+seen_texts = set()
+cmd_in_progress = False
+
+rnode_data = {'messages':[], 'status':'⏳', 'metrics': {'frequency':'?', 'tx_power':'?', 'sf':'?', 'cr':'?', 'rxb':0, 'txb':0}}
+rnode_lock = threading.Lock()
+rnode_ser = None
+
+def get_params_from_config():
+    if not os.path.exists(RNODE_CONFIG): return {}
+    cfg = configparser.ConfigParser(); cfg.read(RNODE_CONFIG)
+    for sec in cfg.sections():
+        if cfg.get(sec, 'type', fallback='').lower() == 'rnodeinterface':
+            return {k: cfg.get(sec, k) for k in ['frequency','tx_power','spreading_factor','bandwidth','coding_rate']}
+    return {}
+
+def decode_payload(line):
+    # 1. Ищем явное поле text
+    tm = re.search(r"'text':\s*'((?:\\.|[^'])*)'", line)
+    if tm:
+        txt = tm.group(1).replace('\\n', ' ').replace('\\t', ' ').strip()
+        if txt and len(txt) >= 2: return txt
+    # 2. Ищем payload
+    for q in ["'", '"']:
+        m = re.search(r"payload:\s*b" + q + r"((?:\\.|[^" + q + r"])*)", line)
+        if not m: continue
+        raw = m.group(1); res = bytearray(); i = 0
+        while i < len(raw):
+            if raw[i] == '\\' and i + 3 < len(raw) and raw[i+1] == 'x':
+                try: res.append(int(raw[i+2:i+4], 16)); i += 4; continue
+                except: pass
+            elif raw[i] == '\\' and i + 1 < len(raw): i += 2
+            else:
+                if 32 <= ord(raw[i]) <= 126: res.append(ord(raw[i]))
+                i += 1
+        try:
+            txt = res.decode('utf-8', errors='ignore').strip()
+            if txt and len(txt) >= 2 and 'proto' not in txt.lower(): return txt
+        except: pass
+    return None
+
+def kiss_encode(frame):
+    return b'\xc0' + frame.replace(b'\xdb', b'\xdb\xdd').replace(b'\xc0', b'\xdb\xdc') + b'\xc0'
+
+def kiss_decode(data):
+    frames, buf, escape = [], b'', False
+    for byte in data:
+        if escape:
+            buf += b'\xc0' if byte == 0xdc else b'\xdb' if byte == 0xdd else bytes([byte])
+            escape = False
+        elif byte == 0xdb: escape = True
+        elif byte == 0xc0:
+            if buf: frames.append(buf); buf = b''
+        else: buf += bytes([byte])
+    return frames
+
+def reader_loop():
+    global seen_texts
+    last_pos = os.path.getsize(DATA_FILE) if os.path.exists(DATA_FILE) else 0
+    while True:
+        try:
+            if not os.path.exists(DATA_FILE): time.sleep(2); continue
+            cur = os.path.getsize(DATA_FILE)
+            if cur < last_pos: last_pos = 0
+            if cur <= last_pos: time.sleep(1); continue
+            with open(DATA_FILE, 'rb') as f:
+                f.seek(last_pos); chunk = f.read(); last_pos = f.tell()
+            for line in chunk.decode('utf-8', errors='ignore').splitlines():
+                line = line.strip()
+                if not line: continue
+                ts = datetime.now().strftime('%H:%M')
+                
+                # Парсинг имен (Надежный поиск по подстрокам)
+                if "'longName':" in line:
+                    # Извлекаем ID. Формат в логе: 'id': '!0a675cfe' или 'id': '0a675cfe'
+                    id_search = re.search(r"'id':\s*'!?([a-f0-9]+)'", line)
+                    # Извлекаем LongName. Формат: 'longName': 'radio_operator'
+                    name_search = re.search(r"'longName':\s*'([^']+)'", line)
+                    
+                    if id_search and name_search:
+                        fid = id_search.group(1)
+                        name = name_search.group(1)
+                        with data_lock:
+                            if fid not in data['nodes']:
+                                data['nodes'][fid] = {'last_seen': ts, 'name': name, 'rssi': '', 'snr': '', 'seen_ts': time.time()}
+                            else:
+                                data['nodes'][fid]['name'] = name
+
+                # Парсинг сообщений и метрик
+                fid_m = re.search(r"'fromId':\s*'!?([a-f0-9]+)'", line)
+                if fid_m:
+                    fid = fid_m.group(1)
+                    rssi_m = re.search(r"'rxRssi':\s*(-?\d+)", line)
+                    snr_m = re.search(r"'rxSnr':\s*(-?\d+\.?\d*)", line)
+                    bat = re.search(r"battery_level[:\s]+(\d+)", line)
+                    volt = re.search(r"'voltage':\s*([\d.]+)", line)
+                    
+                    with data_lock:
+                        if fid not in data['nodes']:
+                            data['nodes'][fid] = {'last_seen': ts, 'name': '', 'rssi': '', 'snr': '', 'seen_ts': time.time()}
+                        data['nodes'][fid]['last_seen'] = ts
+                        data['nodes'][fid]['seen_ts'] = time.time()
+                        if rssi_m: data['nodes'][fid]['rssi'] = rssi_m.group(1)
+                        if snr_m: data['nodes'][fid]['snr'] = snr_m.group(1)
+                        if bat: data['battery'] = f"{bat.group(1)}%"
+                        if volt: data['voltage'] = f"{volt.group(1)}V"
+                        data['status'] = '🟢 Online'
+
+                text = decode_payload(line)
+                if text and fid_m and len(text) >= 2:
+                    key = f"{fid}:{text}"
+                    if key not in seen_texts:
+                        seen_texts.add(key)
+                        sender = data['nodes'].get(fid, {}).get('name', fid[:6])
+                        with data_lock:
+                            data['messages'].insert(0, {'time': datetime.now().strftime('%H:%M:%S'), 'text': text, 'sender': sender, 'sender_id': fid})
+                            if len(data['messages']) > 50: data['messages'] = data['messages'][:50]
+        except Exception as e:
+            with open('/home/alex/mesh_err.log', 'a') as f: f.write(f"{datetime.now()}: {e}\n")
+        time.sleep(1)
+
+def rnode_reader_loop():
+    global rnode_ser
+    while True:
+        try:
+            if not rnode_ser or not rnode_ser.is_open:
+                if os.path.exists(RNODE_PORT):
+                    rnode_ser = serial.Serial(RNODE_PORT, baudrate=RNODE_BAUD, timeout=1, write_timeout=1)
+                    with rnode_lock: rnode_data['status'] = '🟢 Online'
+                else:
+                    with rnode_lock: rnode_data['status'] = '🔌 Ожидание...'
+                    time.sleep(3); continue
+            if rnode_ser.in_waiting:
+                raw = rnode_ser.read(rnode_ser.in_waiting)
+                for f in kiss_decode(raw):
+                    if len(f) > 1 and f[0] == 0x00:
+                        try:
+                            text = f[1:].decode('utf-8', errors='ignore').strip()
+                            if text and len(text) >= 2:
+                                with rnode_lock:
+                                    rnode_data['messages'].insert(0, {'time': datetime.now().strftime('%H:%M:%S'), 'text': text, 'sender': 'RNode'})
+                                    if len(rnode_data['messages']) > 50: rnode_data['messages'] = rnode_data['messages'][:50]
+                        except: pass
+            time.sleep(0.05)
+        except: 
+            if rnode_ser: rnode_ser.close()
+            time.sleep(3)
+
+def metrics_loop():
+    while True:
+        try:
+            r = subprocess.run([RN_PATH, '-j', '-a'], capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                jd = json.loads(r.stdout)
+                with data_lock:
+                    data['rnode_totals'] = {'rxb': jd.get('rxb', 0), 'txb': jd.get('txb', 0)}
+                    data['rnode_interfaces'] = [{'name': i.get('name', ''), 'type': i.get('type', ''), 'status': 'Up' if i.get('status') else 'Down', 'rx': f"{i.get('rxb',0)/1024:.1f}KB", 'tx': f"{i.get('txb',0)/1024:.1f}KB"} for i in jd.get('interfaces', [])]
+            cfg = get_params_from_config()
+            if cfg:
+                with rnode_lock:
+                    for k in ['frequency','tx_power','spreading_factor','bandwidth','coding_rate']:
+                        if cfg.get(k): rnode_data['metrics'][k if k != 'spreading_factor' else 'sf'] = cfg[k]
+        except: pass
+        time.sleep(30)
+
+def update_network_loop():
+    while True:
+        try:
+            i={'wifi_ip':'—','vpn_ip':'—'}
+            for n,k in [('wlp2s0','wifi_ip'),('tun0','vpn_ip')]:
+                try:
+                    a=netifaces.ifaddresses(n)
+                    if netifaces.AF_INET in a: i[k]=a[netifaces.AF_INET][0]['addr']
+                except:pass
+            with data_lock: data['network'] = i
+            try:
+                r=subprocess.run(['ping','-c','1','-W','1',RNODE_HOST],capture_output=True,text=True,timeout=2)
+                ms='—'
+                if 'time=' in r.stdout: ms=f"{float(r.stdout.split('time=')[1].split()[0]):.0f}ms"
+                with data_lock: data['rnode'] = {'status':'online' if r.returncode==0 else 'offline','ping':ms,'last_check':datetime.now().strftime('%H:%M')}
+            except: pass
+        except: pass
+        time.sleep(15)
+
+@app.route('/api/sendmsg', methods=['POST'])
+def send_msg():
+    global cmd_in_progress
+    d = request.json or {}; text = d.get('text', '').strip(); dest = d.get('dest', None)
+    if not text: return jsonify({'status': 'error', 'msg': 'Пустой текст'}), 400
+    if cmd_in_progress: return jsonify({'status': 'error', 'msg': 'Занято'}), 409
+    cmd_in_progress = True
+    try:
+        # Останавливаем слушатель, чтобы освободить порт
+        subprocess.run(['pkill', '-f', 'meshtastic.*listen'], capture_output=True); time.sleep(2)
+        
+        cmd = [MESHTASTIC_BIN, '--port', '/dev/meshtastic']
+        
+        # Формируем команду
+        if dest:
+            # Личное сообщение
+            cmd += ['--dest', f'!{dest}', '--sendtext', text]
+        else:
+            # Общее сообщение (в Primary Channel). 
+            # В некоторых версиях CLI нужно явно указать --ch-index 0
+            cmd += ['--ch-index', '0', '--sendtext', text]
+            
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        
+        if r.returncode == 0: 
+            return jsonify({'status': 'ok', 'msg': '✅ Отправлено'})
+        else:
+            err = r.stderr.strip() if r.stderr else "Unknown error"
+            return jsonify({'status': 'error', 'msg': f'CLI Error: {err[:100]}'})
+    except Exception as e: 
+        return jsonify({'status': 'error', 'msg': str(e)})
+    finally: 
+        cmd_in_progress = False
+
+@app.route('/api/rnode_msg', methods=['POST'])
+def rnode_send():
+    d = request.json or {}; text = d.get('text', '').strip()[:230]
+    if not text: return jsonify({'status': 'error'}), 400
+    try:
+        ser = serial.Serial(RNODE_PORT, baudrate=RNODE_BAUD, timeout=2)
+        ser.write(kiss_encode(b'\x00' + text.encode())); ser.flush(); ser.close()
+        return jsonify({'status': 'ok'})
+    except Exception as e: return jsonify({'status': 'error', 'msg': str(e)[:80]}), 500
+
+@app.route('/api/rnode_mode', methods=['GET', 'POST'])
+def rnode_mode_api():
+    token = request.args.get('token') or (request.json.get('token') if request.is_json else '')
+    if token != REBOOT_TOKEN: return jsonify({'status':'error','msg':'Access denied'}), 403
+    if request.method == 'GET': 
+        cfg = configparser.ConfigParser(); cfg.read(RNODE_CONFIG)
+        mode = 'tcp'
+        for sec in cfg.sections():
+            if cfg.get(sec, 'type', fallback='').lower() == 'rnodeinterface': mode = 'direct'
+        return jsonify({'current_mode': mode})
+    d = request.json or {}; mode = d.get('mode', '').lower()
+    if mode not in ['direct', 'tcp']: return jsonify({'status':'error'}), 400
+    # Логика переключения режимов (упрощена для стабильности)
+    return jsonify({'status':'ok','msg':'Mode switch requested'})
+
+@app.route('/api/meshcmd', methods=['POST'])
+def meshcmd():
+    global cmd_in_progress
+    token=request.args.get('token') or (request.json.get('token') if request.is_json else '')
+    action=request.args.get('action') or (request.json.get('action') if request.is_json else '')
+    if token!=REBOOT_TOKEN: return jsonify({'status':'error','msg':'Access denied'}), 403
+    if cmd_in_progress: return jsonify({'status':'error','msg':'Busy'}), 409
+    cmd_in_progress=True
+    try:
+        subprocess.run(['pkill','-f','meshtastic.*listen'],capture_output=True); time.sleep(2)
+        if action=='reboot': r=subprocess.run([MESHTASTIC_BIN,'--port','/dev/meshtastic','--reboot'],capture_output=True,text=True,timeout=15)
+        elif action=='shutdown': r=subprocess.run([MESHTASTIC_BIN,'--port','/dev/meshtastic','--shutdown'],capture_output=True,text=True,timeout=15)
+        elif action=='send_location': r=subprocess.run([MESHTASTIC_BIN,'--port','/dev/meshtastic','--setlat','0','--setlon','0'],capture_output=True,text=True,timeout=15)
+        elif action=='mqtt_tls_off': r=subprocess.run([MESHTASTIC_BIN,'--port','/dev/meshtastic','--set','mqtt.tls_enabled','false'],capture_output=True,text=True,timeout=15)
+        return jsonify({'status':'ok','msg':'Command sent'})
+    except Exception as e: return jsonify({'status':'error','msg':str(e)})
+    finally: cmd_in_progress=False
+
+@app.route('/data')
+def get_data():
+    with data_lock: return jsonify(data)
+
+@app.route('/api/rnode_data')
+def get_rnode():
+    with rnode_lock: return jsonify(rnode_data)
+
+HTML = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Meshtastic Monitor v20.8</title><style>
+body{background:#0a0a0a;color:#e0e0e0;font-family:sans-serif;padding:10px}
+.hdr{background:#1a1a1a;padding:10px;border-radius:8px;margin-bottom:10px;text-align:center}
+.hdr-main{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;align-items:center;font-size:12px}
+.hdr-sep{color:#555;margin:0 4px;font-size:14px}
+#st{font-weight:600;color:#00c853}
+.hdr-bot{font-size:10px;color:#888;margin-top:4px}.hdr-bot .ok{color:#4caf50}.hdr-bot .err{color:#f44336}
+.flt{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;justify-content:center}
+.flt button{background:#2a2a2a;color:#888;border:1px solid #444;padding:6px 10px;border-radius:6px;font-size:12px;cursor:pointer}
+.flt button.a{background:#00c853;color:#000;font-weight:600}
+.loc-bar{background:#111;border:1px solid #333;border-radius:6px;padding:6px 10px;margin-bottom:10px;text-align:center;font-size:11px;color:#aaa}
+.loc-bar b{color:#e0e0e0}.loc-bar .subid{color:#00c853;font-weight:600}
+.card{background:#151515;padding:10px;border-radius:8px;margin-bottom:10px}
+.card h3{font-size:13px;color:#00c853;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
+.msg{padding:6px 0;border-bottom:1px solid #222;font-size:13px;word-break:break-word;display:flex;justify-content:space-between;align-items:flex-start}
+.msg-content{flex:1;min-width:0}.msg .t{color:#666;font-size:10px;margin-right:6px;white-space:nowrap}.msg .s{color:#ffb300;font-weight:600;margin-right:6px}
+.msg-act{cursor:pointer;margin-left:4px;opacity:0.7;font-size:11px;padding:2px 4px;border-radius:3px;background:#333;color:#fff}
+.msg-act:hover{opacity:1;background:#00c853;color:#000}
+.nd{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #222;font-size:12px;transition:opacity 0.3s}
+.nd .id{color:#00c853;font-weight:600}.nd .subid{color:#666;font-size:10px;margin-left:6px}
+.bg{background:#222;padding:2px 6px;border-radius:4px;font-size:10px;margin-left:4px}
+.g{color:#4caf50}.o{color:#ff9800}.b{color:#f44336}.stale{background:#333!important;color:#777!important}
+.list{max-height:35vh;overflow-y:auto}
+.ifc-card{background:#1a1a1a;padding:8px;margin:6px 0;border-radius:6px;border-left:3px solid #444}
+.ifc-card.up{border-left-color:#4caf50}.ifc-card .name{font-weight:600;color:#e0e0e0;font-size:12px}
+.ifc-card .meta{color:#888;font-size:11px;margin-top:2px}.ifc-card .traffic{color:#aaa;font-size:10px;margin-top:4px}
+.btn-lora{background:#b71c1c;color:#fff;border:none;padding:6px 10px;border-radius:5px;font-size:11px;cursor:pointer;margin-right:6px}
+.btn-lora.loc{background:#0d47a1}.btn-lora.mqtt{background:#6a1b9a}.btn-lora.off{background:#4a148c}
+.btn-lora:hover{opacity:0.9}.btn-row{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
+.reply-bar{background:#151515;border-top:1px solid #444;padding:10px;margin-top:10px;display:none;border-radius:0 0 8px 8px}
+.reply-bar.active{display:block}
+.quote-box{font-size:10px;color:#888;background:#222;padding:4px 6px;border-left:3px solid #00c853;margin-bottom:6px;white-space:pre-wrap;max-height:36px;overflow:hidden;opacity:0.8}
+.reply-row{display:flex;gap:6px;align-items:center}
+.reply-input{flex:1;background:#2a2a2a;border:1px solid #444;color:#e0e0e0;padding:6px;border-radius:4px;font-size:12px;outline:none}
+.reply-input:focus{border-color:#00c853}
+.reply-send{background:#00c853;color:#000;border:none;padding:6px 10px;border-radius:4px;font-size:12px;cursor:pointer;font-weight:600}
+.reply-cancel{background:#444;color:#ccc;border:none;padding:6px 8px;border-radius:4px;font-size:11px;cursor:pointer}
+.reply-toggle{background:#333;color:#fff;border:none;padding:4px 8px;border-radius:4px;font-size:10px;cursor:pointer}
+.reply-toggle.active{background:#00c853;color:#000}
+</style>
+<style>
+#rnodeModeBtn { transition: all 0.3s ease; border: none; }
+#rnodeModeBtn.mode-direct { background-color: #0d47a1 !important; color: white !important; box-shadow: 0 0 8px rgba(13, 71, 161, 0.5); }
+#rnodeModeBtn.mode-tcp { background-color: #6a1b9a !important; color: white !important; box-shadow: 0 0 8px rgba(106, 27, 154, 0.5); }
+#rnodeModeBtn:hover { opacity: 0.9; transform: scale(1.05); }
+</style>
+</head><body>
+<div class="hdr"><div class="hdr-main">
+  <span id="st">⏳ Meshtastic</span><span id="bt">🔋?</span><span id="vt">⚡?</span><span id="wf">📶—</span>
+  <span id="rn">📡 RNode</span><span class="hdr-sep">|</span><span id="vp">🌐 VPN: —</span>
+</div><div class="hdr-bot"><span id="rn_st" class="ok">● online</span> <span id="rn_pg">ping: —</span> <span id="rn_lc">check: —</span></div></div>
+<div class="flt"><button onclick="sf(0.5,this)">30м</button><button onclick="sf(1,this)">1ч</button><button onclick="sf(6,this)">6ч</button>
+<button class="a" onclick="sf(12,this)">12ч</button><button onclick="sf(24,this)">24ч</button><button onclick="sf(999,this)">Все</button></div>
+<div class="loc-bar">📟 <b id="loc_name">загрузка...</b> <span class="subid" id="loc_id">(!—)</span> | ⏱ В эфире: <span id="loc_time">—</span></div>
+<div class="card"><h3>📡 Meshtastic Node <span id="nc">0</span></h3><div id="nl" class="list">—</div></div>
+<div class="card"><h3>💬 Meshtastic Chat <span id="mc">0</span></h3><div id="ml" class="list" style="padding-bottom:40px">—</div>
+<div class="reply-bar" id="replyBar">
+  <div style="font-size:10px;color:#00c853;margin-bottom:4px;display:none" id="replyModeLabel">💬 Ответ</div>
+  <div class="quote-box" id="quoteBox"></div>
+  <div class="reply-row">
+    <input type="text" id="replyInput" class="reply-input" placeholder="Введите ответ...">
+    <button class="reply-toggle active" id="quoteToggle" onclick="toggleQuote()">🔁 Цитата</button>
+    <button class="reply-send" onclick="sendReply()">➤</button>
+    <button class="reply-cancel" onclick="cancelReply()">✕</button>
+  </div>
+</div></div>
+<div class="card" id="rnodeCard">
+  <h3>💬 RNode Chat <span class="sub" id="rn_chat_status">⏳</span></h3>
+  <div style="display:flex;justify-content:flex-end;margin:-4px -4px 4px 0;gap:6px">
+    <button class="reply-toggle" onclick="toggleRNodeDetails()" style="padding:2px 6px;font-size:10px">⚙️ Детали</button>
+    <button id="rnodeModeBtn" class="reply-toggle mode-direct" onclick="switchRNodeMode()" style="padding:2px 6px;font-size:10px;background:#333;color:#fff">🔄 Загрузка...</button>
+  </div>
+  <div id="rnodeDetails" style="display:none;background:#111;padding:8px;border-radius:4px;margin:0 0 8px 0;font-size:11px;color:#aaa">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+      <div>📡 Порт: <b id="rd_port">—</b></div><div>⚡ Бод: <b id="rd_baud">—</b></div>
+      <div>📶 Частота: <b id="rd_freq">—</b></div><div>📏 BW: <b id="rd_bw">—</b></div>
+      <div>🔋 TX: <b id="rd_txp">—</b></div><div>🔀 SF/CR: <b id="rd_sfcr">—</b></div>
+      <div>📥 RX: <b id="rd_rxb">—</b></div><div>📤 TX: <b id="rd_txb">—</b></div>
+    </div>
+  </div>
+  <div id="rnode_msgs" class="list" style="max-height:20vh"><div style="padding:8px;color:#555">⏳ Ожидание сообщений...</div></div>
+  <div style="display:flex;gap:6px;margin-top:8px"><input type="text" id="rnode_input" class="reply-input" placeholder="Сообщение для RNode..." style="flex:1">
+    <button class="reply-send" onclick="sendRNode()">➤</button></div>
+</div>
+
+<div class="card">
+  <h3>📡 RNode Nodes <span id="rnc">0</span></h3>
+  <div class="flt" style="justify-content:flex-start;margin-bottom:4px">
+    <button onclick="srf(1,this)" class="a" style="font-size:10px;padding:2px 6px">1ч</button>
+    <button onclick="srf(12,this)" style="font-size:10px;padding:2px 6px">12ч</button>
+    <button onclick="srf(999,this)" style="font-size:10px;padding:2px 6px">Все</button>
+  </div>
+  <div id="rnl" class="list">—</div>
+</div>
+
+<div class="card"><h3>🌐 RNode Interfaces <span class="sub" id="rn_upd">—</span></h3><div id="rn_details" class="list">—</div>
+
+<div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px; margin-top:15px;">
+    <button class="cbtn" onclick="rebootMeshtastic()">🔄 Restart Mesh</button>
+    <button class="cbtn danger" onclick="poweroffMeshtastic()">⏻ Mesh Off</button>
+    <button class="cbtn" onclick="rebootRNode()">🔄 Restart RNode</button>
+    <button class="cbtn danger" onclick="poweroffRNode()">⏻ RNode Off</button>
+    <button class="cbtn warn" onclick="sendLocation()">📍 Send Loc</button>
+    <button class="cbtn danger" onclick="rebootServer()">⚠️ Reboot Srv</button>
+</div>
+<style>
+.cbtn { background:#2c3e50; color:#fff; border:none; padding:12px; border-radius:6px; cursor:pointer; font-size:12px; transition:0.2s; }
+.cbtn:hover { background:#34495e; transform:translateY(-1px); }
+.cbtn.danger { background:#c0392b; }
+.cbtn.danger:hover { background:#e74c3c; }
+.cbtn.warn { background:#d35400; }
+</style>
+</div>
+
+<script>
+let cf=12,$=id=>document.getElementById(id);
+let currentMessages = [];
+let reply = { destId: null, isPrivate: false, quote: true, quoteText: '', quoteSender: '' };
+function sc(v){if(!v)return'';let n=parseInt(v);return n>-60?'g':n>-90?'o':'b'}
+function up(){fetch('/data').then(r=>r.json()).then(d=>{
+$('st').innerText=(d.status||'').includes('Online')?'🟢 Meshtastic':'⏳ Meshtastic';$('bt').innerText=d.battery||'🔋?';$('vt').innerText=d.voltage||'⚡?';
+$('wf').innerText='📶'+(d.network?d.network.wifi_ip:'—');$('rn').innerText=(d.rnode&&d.rnode.status==='online')?'🟢 RNode':'🔴 RNode';
+$('vp').innerText='🌐 VPN: '+(d.network?d.network.vpn_ip:'—');$('rn_st').innerText='● '+d.rnode.status;$('rn_st').className=d.rnode.status==='online'?'ok':'err';
+$('rn_pg').innerText='ping: '+(d.rnode.ping||'—');$('rn_lc').innerText='check: '+(d.rnode.last_check||'—');
+let ln=d.local_node||{};$('loc_name').innerText=ln.name||'?';$('loc_id').innerText=ln.id?'(!'+ln.id+')':'';$('loc_time').innerText=ln.last_seen||'—';
+let now=Date.now()/1000, active=[], stale=[];
+for(let id in d.nodes){let i=d.nodes[id]; let age=(now-i.seen_ts)/3600; if(age<0)age=0;
+  if(cf!==999 && age>cf) continue;let entry={id:id, i:i, age:age};if(age>0.25) stale.push(entry); else active.push(entry);}
+active.sort((a,b)=>(parseInt(b.i.rssi)||-999)-(parseInt(a.i.rssi)||-999));stale.sort((a,b)=>b.age-a.age);
+let nodesArr=active.concat(stale);let n='', c=nodesArr.length;
+nodesArr.forEach(x=>{let i=x.i; let isStale=x.age>0.25;
+  let nameHtml=i.name?i.name+'<span class="subid">(!'+x.id+')</span>':'!'+x.id;
+  let rssiCls=isStale?'stale':sc(i.rssi);let rssiVal=i.rssi||'-';
+  let timeHtml=isStale?'<span style="color:#777">⏳'+i.last_seen+'</span>':i.last_seen;
+  let style=isStale?'opacity:0.55;':'';
+  n+='<div class="nd" style="'+style+'"><span class="id">'+nameHtml+'</span><span><span class="bg '+rssiCls+'">'+rssiVal+'dB</span><span class="bg">'+(i.snr?'SNR:'+i.snr:'')+'</span><span class="bg">'+timeHtml+'</span></span></div>';});
+$('nc').innerText=c;$('nl').innerHTML=n||'<div style="padding:8px;color:#555">Нет нод</div>';
+currentMessages = d.messages || [];let m='';
+currentMessages.forEach((x,idx)=>{m+='<div class="msg"><div class="msg-content"><span class="t">'+x.time+'</span><span class="s">'+x.sender+':</span>'+x.text+'</div>' +
+'<div style="display:flex;gap:4px"><span class="msg-act" onclick="openReply('+idx+', false)">↩️</span><span class="msg-act" style="background:#0d47a1" onclick="openReply('+idx+', true)">👤</span></div></div>';});
+$('mc').innerText=currentMessages.length;$('ml').innerHTML=m||'<div style="padding:8px;color:#555">Нет сообщений</div>';
+
+fetch('/api/rnode_data').then(r=>r.json()).then(rd=>{
+  $('rn_chat_status').innerText = rd.status || '⏳';
+  let rm=''; (rd.messages||[]).forEach(x=>{rm+='<div class="msg"><span class="t">'+x.time+'</span><span class="s">'+x.sender+':</span>'+x.text+'</div>';});
+  $('rnode_msgs').innerHTML = rm || '<div style="padding:8px;color:#555">⏳ Ожидание сообщений...</div>';
+  let mt = rd.metrics || {};
+  const fb = b => b>=1048576?(b/1048576).toFixed(1)+'MB':b>=1024?(b/1024).toFixed(1)+'KB':b+'B';
+  const fr = r => r>=1000000?(r/1000000).toFixed(1)+'Mbps':r>=1000?(r/1000).toFixed(0)+'kbps':r+'bps';
+  const fv = (v,u) => (v && v!=='?') ? v+u : '—';
+  $('rd_port').innerText = mt.port||'—'; $('rd_baud').innerText = mt.bitrate?fr(mt.bitrate):'—';
+  $('rd_freq').innerText = fv(mt.frequency,' MHz'); $('rd_bw').innerText = fv(mt.bandwidth,' kHz');
+  $('rd_txp').innerText = fv(mt.tx_power,' dBm'); 
+  $('rd_sfcr').innerText = (mt.sf!=='?'&&mt.cr!=='?') ? `SF${mt.sf}/CR ${mt.cr}` : '—';
+  $('rd_rxb').innerText = fb(mt.rxb||0); $('rd_txb').innerText = fb(mt.txb||0);
+});
+
+updateRNodeNodes(d);
+let ifcs=d.rnode_interfaces||[],tots=d.rnode_totals||{};$('rn_upd').innerText='↑'+tots.txb+' ↓'+tots.rxb;
+let h='';if(ifcs.length===0)h='<div style="padding:8px;color:#555">Загрузка...</div>';else ifcs.forEach(i=>{h+='<div class="ifc-card '+(i.status=='Up'?'up':'')+'"><div class="name">'+i.name+'</div><div class="meta">'+i.type+' | '+i.status+'</div><div class="traffic">↑ '+i.tx+' | ↓ '+i.rx+'</div></div>';});
+$('rn_details').innerHTML=h;})}
+function sf(h,btn){cf=h;document.querySelectorAll('.flt button').forEach(b=>b.classList.remove('a'));if(btn)btn.classList.add('a');up();}
+function openReply(idx, isPrivate=false){
+  if(!currentMessages[idx]) return;
+  let msg = currentMessages[idx];
+  reply = { destId: msg.sender_id, isPrivate: isPrivate, quote: !isPrivate, quoteText: msg.text, quoteSender: msg.sender };
+  $('replyModeLabel').style.display = 'block';
+  $('replyModeLabel').innerText = isPrivate ? '📩 Личное: '+msg.sender : '💬 В общий чат';
+  if(reply.quote){
+    let t = msg.text.length>60 ? msg.text.substring(0,60)+'...' : msg.text;
+    $('quoteBox').innerText = '> '+msg.sender+': '+t;
+    $('quoteBox').style.display = 'block';
+    $('quoteToggle').classList.add('active');
+  } else {
+    $('quoteBox').style.display = 'none';
+    $('quoteToggle').classList.remove('active');
+  }
+  $('replyBar').classList.add('active');
+  $('replyInput').value = ''; $('replyInput').focus();
+}
+function toggleQuote(){
+  reply.quote = !reply.quote;
+  if(reply.quote && reply.quoteText){
+    $('quoteBox').style.display = 'block'; $('quoteToggle').classList.add('active');
+  } else {
+    $('quoteBox').style.display = 'none'; $('quoteToggle').classList.remove('active');
+  }
+}
+function cancelReply(){ $('replyBar').classList.remove('active'); }
+function sendReply(){
+  let t = $('replyInput').value.trim(); if(!t) return;
+  let f = t;
+  if(reply.quote && reply.quoteText){
+    let q = reply.quoteText.length>60 ? reply.quoteText.substring(0,60)+'...' : reply.quoteText;
+    f = '> '+reply.quoteSender+': '+q+' | '+t;
+  }
+  if(f.length>220) f = f.substring(0,217)+'...';
+  let payload = {text: f};
+  if(reply.isPrivate) payload.dest = reply.destId;
+  fetch('/api/sendmsg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
+  .then(r=>r.json()).then(res=>{alert(res.msg||'Отправлено'); cancelReply(); up();}).catch(e=>alert('Ошибка'));
+}
+function sendRNode(){let t=$('rnode_input').value.trim();if(!t)return;
+  fetch('/api/rnode_msg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})})
+  .then(r=>r.json()).then(res=>{if(res.status=='ok'){$('rnode_input').value='';up()}}).catch(e=>alert('Ошибка'));}
+function toggleRNodeDetails(){let e=document.getElementById('rnodeDetails');e.style.display=e.style.display==='none'?'block':'none';}
+function switchRNodeMode(){alert('Переключение режима временно недоступно в этой версии');}
+function meshCmd(action){let m={reboot:'Перезагрузить?',shutdown:'Выключить?',send_location:'Отправить координаты?',mqtt_tls_off:'Отключить TLS MQTT?'};
+  if(!confirm('⚠️ '+(m[action]||'Продолжить?')))return;
+  fetch(`/api/meshcmd?action=${action}&token=my_secret_reboot_token`,{method:'POST'}).then(r=>r.json()).then(d=>alert(d.msg||'Готово'));}
+const REBOOT_TOKEN = 'my_secret_reboot_token';
+setInterval(up,3000);up();
+</script>
+<script>
+// --- Логика RNode Nodes ---
+let rcf=12;
+function srf(h,b){rcf=h;document.querySelectorAll('.flt button').forEach(x=>x.classList.remove('a'));if(b)b.classList.add('a');up();}
+function updateRNodeNodes(d){
+    let ns=d.rnode_nodes||[];
+    let now=Date.now()/1000;
+    let ac=ns.filter(n=>(rcf===999||(now-n.seen_ts)/3600<=rcf));
+    let h='';
+    ac.forEach(n=>{
+        let rc = n.rssi==='?' ? '' : (parseInt(n.rssi)>-90 ? 'g' : 'o');
+        h += '<div class="nd"><span class="id">'+n.id+'</span><span><span class="bg '+rc+'">'+n.rssi+'dB</span><span class="bg">'+n.last_seen+'</span></span></div>';
+    });
+    $('rnc').innerText=ac.length;
+    $('rnl').innerHTML=h || '<div style="padding:8px;color:#555">Нет узлов</div>';
+}
+
+// --- Логика Кнопки Режим ---
+(function() {
+    const TOKEN = 'my_secret_reboot_token';
+    function updateBtn(mode) {
+        console.log("Setting mode to:", mode);
+        let btn = document.getElementById('rnodeModeBtn');
+        if (!btn) return;
+        btn.innerText = mode === 'direct' ? '🔌 Direct' : '🌐 TCP';
+        btn.style.background = mode === 'direct' ? '#0d47a1' : '#6a1b9a';
+    }
+    
+    
+    setTimeout(loadRNodeMode, 1000);
+})();
+
+// --- Функции кнопок управления ---
+function rebootMeshtastic() { if(!confirm('Restart Meshtastic?')) return; fetch('/api/reboot_meshtastic?token='+REBOOT_TOKEN, {method:'POST'}).then(r=>r.json()).then(d=>alert(d.msg)); }
+function poweroffMeshtastic() { if(!confirm('Stop Meshtastic?')) return; fetch('/api/poweroff_lora?token='+REBOOT_TOKEN, {method:'POST'}).then(r=>r.json()).then(d=>alert(d.msg)); }
+function rebootRNode() { if(!confirm('Restart RNode?')) return; fetch('/api/reboot_rnode?token='+REBOOT_TOKEN, {method:'POST'}).then(r=>r.json()).then(d=>{ alert(d.msg); setTimeout(()=>location.reload(), 2000); }); }
+function poweroffRNode() { if(!confirm('Stop RNode?')) return; fetch('/api/poweroff_rnode?token='+REBOOT_TOKEN, {method:'POST'}).then(r=>r.json()).then(d=>alert(d.msg)); }
+function sendLocation() { fetch('/api/send_location?token='+REBOOT_TOKEN, {method:'POST'}).then(r=>r.json()).then(d=>alert(d.msg)); }
+function rebootServer() { if(!confirm('REBOOT SERVER?')) return; fetch('/api/reboot_server?token='+REBOOT_TOKEN, {method:'POST'}).then(r=>r.json()).then(d=>alert(d.msg)); }
+</script>
+
+
+<style>
+/* Принудительные цвета для кнопки режима */
+button#rnodeModeBtn { transition: background 0.3s; }
+</style>
+<script>
+// Переопределяем функцию updateBtn глобально
+window.updateBtn = function(mode) {
+    let btn = document.getElementById('rnodeModeBtn');
+    if (!btn) return;
+    if (mode === 'direct') {
+        btn.innerText = '🔌 Direct';
+        btn.style.backgroundColor = '#0d47a1';
+        btn.style.color = '#fff';
+        // Пробуем через атрибут style напрямую
+        btn.setAttribute('style', 'padding:2px 6px;font-size:10px;background:#0d47a1 !important;color:#fff !important;');
+    } else {
+        btn.innerText = '🌐 TCP';
+        btn.style.backgroundColor = '#6a1b9a';
+        btn.style.color = '#fff';
+        btn.setAttribute('style', 'padding:2px 6px;font-size:10px;background:#6a1b9a !important;color:#fff !important;');
+    }
+    console.log("Force color applied:", mode);
+}
+</script>
+
+<script>
+// --- Логика Кнопки Режим ---
+function updateBtn(mode) {
+    let btn = document.getElementById('rnodeModeBtn');
+    if (!btn) { console.log("Btn not found"); return; }
+    
+    console.log("Applying mode:", mode);
+    
+    if (mode === 'direct') {
+        btn.innerText = '🔌 Direct';
+        // Прямое изменение стиля с !important
+        btn.style.setProperty('background-color', '#0d47a1', 'important');
+        btn.style.setProperty('color', '#ffffff', 'important');
+        btn.style.setProperty('border-color', '#0d47a1', 'important');
+    } else {
+        btn.innerText = '🌐 TCP';
+        // Прямое изменение стиля с !important
+        btn.style.setProperty('background-color', '#6a1b9a', 'important');
+        btn.style.setProperty('color', '#ffffff', 'important');
+        btn.style.setProperty('border-color', '#6a1b9a', 'important');
+    }
+    console.log("Style applied. Current bg:", btn.style.backgroundColor);
+}
+
+window.loadRNodeMode = function() {
+    fetch('/api/rnode_mode?token=my_secret_reboot_token')
+    .then(r => r.json())
+    .then(d => { 
+        if(d.current_mode) {
+            updateBtn(d.current_mode);
+            console.log("Mode loaded:", d.current_mode);
+        }
+    })
+    .catch(e => console.error("Mode load error:", e));
+};
+
+window.switchRNodeMode = function() {
+    let btn = document.getElementById('rnodeModeBtn');
+    if(!btn) return;
+    
+    let currentText = btn.innerText;
+    let next = currentText.includes('Direct') ? 'tcp' : 'direct';
+    
+    if (!confirm('Переключить режим на ' + next.toUpperCase() + '? Сервис перезагрузится.')) return;
+    
+    btn.innerText = '⏳ ...';
+    btn.disabled = true;
+    btn.classList.remove('mode-direct', 'mode-tcp');
+    btn.style.background = '#555';
+    
+    fetch('/api/rnode_mode?token=my_secret_reboot_token', {
+        method:'POST', 
+        headers:{'Content-Type':'application/json'}, 
+        body:JSON.stringify({mode:next})
+    })
+    .then(r=>r.json())
+    .then(res=>{ 
+        alert(res.msg); 
+        setTimeout(()=>location.reload(), 2500); 
+    })
+    .catch(e=>{ 
+        alert('Ошибка переключения'); 
+        btn.disabled=false; 
+        loadRNodeMode(); 
+    });
+};
+
+// Запуск при загрузке
+document.addEventListener('DOMContentLoaded', function() {
+    setTimeout(loadRNodeMode, 500);
+});
+</script>
+
+</body></html>'''
+
+@app.route('/')
+def index(): return render_template_string(HTML)
+
+
+def preload_node_names():
+    print("🔄 Загрузка имен из истории...")
+    if not os.path.exists(DATA_FILE): return
+    count = 0
+    try:
+        with open(DATA_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                if "'longName':" in line:
+                    id_m = re.search(r"'id':\s*'!?([a-f0-9]+)'", line)
+                    name_m = re.search(r"'longName':\s*'([^']+)'", line)
+                    if id_m and name_m:
+                        fid = id_m.group(1)
+                        name = name_m.group(1)
+                        with data_lock:
+                            if fid not in data['nodes']:
+                                data['nodes'][fid] = {'last_seen': '—', 'name': name, 'rssi': '', 'snr': '', 'seen_ts': time.time()}
+                            else:
+                                data['nodes'][fid]['name'] = name
+                        count += 1
+        print(f"✅ Загружено {count} имен нод")
+    except Exception as e:
+        print(f"❌ Ошибка загрузки: {e}")
+
+if __name__=='__main__':
+    preload_node_names()
+    threading.Thread(target=reader_loop, daemon=True).start()
+    threading.Thread(target=rnode_reader_loop, daemon=True).start()
+    threading.Thread(target=metrics_loop, daemon=True).start()
+    threading.Thread(target=update_network_loop, daemon=True).start()
+    print("✅ Запуск v20.8 (Full Restore)...")
+    app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
