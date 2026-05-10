@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.10
-import os, re, time, json, threading, subprocess, socketserver, serial, configparser, shutil
+import os, re, time, json, threading, subprocess, socketserver, serial, configparser
 from datetime import datetime
 from flask import Flask, jsonify, render_template_string, request
 import netifaces
@@ -13,15 +13,15 @@ PORT = 5002
 RN_PATH = '/home/alex/.local/bin/rnstatus'
 MESHTASTIC_BIN = '/home/alex/.local/bin/meshtastic'
 REBOOT_TOKEN = os.environ.get('REBOOT_TOKEN', 'my_secret_reboot_token')
-RNODE_PORT = os.environ.get('RNODE_PORT', '/dev/rnode')
+RNODE_PORT = '/dev/ttyACM1'
 RNODE_BAUD = 115200
 RNODE_CONFIG = os.path.expanduser('~/.reticulum/config')
-TRANSPORT_SERVICE = 'rnode-transport'
+MESHTASTIC_PATTERN = "meshtastic.*--port.*/dev/meshtastic"
 
 data = {'messages':[],'nodes':{},'battery':'?','voltage':'?','status':'⏳ Загрузка...',
         'network':{'wifi_ip':'—','vpn_ip':'—'},
         'rnode':{'status':'unknown','ping':'—','last_check':'—'},
-        'rnode_interfaces':[], 'rnode_totals':{},
+        'rnode_interfaces':[], 'rnode_totals':{}, 'rnode_nodes': [],
         'local_node':{'name':'Loko','id':'0a675cfe','last_seen':datetime.now().strftime('%H:%M')}}
 data_lock = threading.Lock()
 seen_texts = set()
@@ -40,12 +40,10 @@ def get_params_from_config():
     return {}
 
 def decode_payload(line):
-    # 1. Ищем явное поле text
     tm = re.search(r"'text':\s*'((?:\\.|[^'])*)'", line)
     if tm:
         txt = tm.group(1).replace('\\n', ' ').replace('\\t', ' ').strip()
         if txt and len(txt) >= 2: return txt
-    # 2. Ищем payload
     for q in ["'", '"']:
         m = re.search(r"payload:\s*b" + q + r"((?:\\.|[^" + q + r"])*)", line)
         if not m: continue
@@ -79,6 +77,13 @@ def kiss_decode(data):
         else: buf += bytes([byte])
     return frames
 
+def is_process_running(pattern):
+    try:
+        result = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
+        return result.returncode == 0
+    except:
+        return False
+
 def reader_loop():
     global seen_texts
     last_pos = os.path.getsize(DATA_FILE) if os.path.exists(DATA_FILE) else 0
@@ -95,11 +100,8 @@ def reader_loop():
                 if not line: continue
                 ts = datetime.now().strftime('%H:%M')
                 
-                # Парсинг имен (Надежный поиск по подстрокам)
                 if "'longName':" in line:
-                    # Извлекаем ID. Формат в логе: 'id': '!0a675cfe' или 'id': '0a675cfe'
                     id_search = re.search(r"'id':\s*'!?([a-f0-9]+)'", line)
-                    # Извлекаем LongName. Формат: 'longName': 'radio_operator'
                     name_search = re.search(r"'longName':\s*'([^']+)'", line)
                     
                     if id_search and name_search:
@@ -111,7 +113,6 @@ def reader_loop():
                             else:
                                 data['nodes'][fid]['name'] = name
 
-                # Парсинг сообщений и метрик
                 fid_m = re.search(r"'fromId':\s*'!?([a-f0-9]+)'", line)
                 if fid_m:
                     fid = fid_m.group(1)
@@ -179,7 +180,32 @@ def metrics_loop():
                 jd = json.loads(r.stdout)
                 with data_lock:
                     data['rnode_totals'] = {'rxb': jd.get('rxb', 0), 'txb': jd.get('txb', 0)}
-                    data['rnode_interfaces'] = [{'name': i.get('name', ''), 'type': i.get('type', ''), 'status': 'Up' if i.get('status') else 'Down', 'rx': f"{i.get('rxb',0)/1024:.1f}KB", 'tx': f"{i.get('txb',0)/1024:.1f}KB"} for i in jd.get('interfaces', [])]
+                    interfaces = []
+                    for i in jd.get('interfaces', []):
+                        rx_kb = i.get('rxb', 0) / 1024.0
+                        tx_kb = i.get('txb', 0) / 1024.0
+                        interfaces.append({
+                            'name': i.get('name', ''),
+                            'type': i.get('type', ''),
+                            'status': 'Up' if i.get('status') else 'Down',
+                            'rx': f"{rx_kb:.1f}KB",
+                            'tx': f"{tx_kb:.1f}KB"
+                        })
+                    data['rnode_interfaces'] = interfaces
+                    nodes_raw = jd.get('nodes') or jd.get('destinations') or []
+                    nodes_parsed = []
+                    now_ts = time.time()
+                    for n in nodes_raw:
+                        node_id = n.get('id', n.get('hash', '?'))
+                        rssi_val = n.get('rssi', n.get('signal', '?'))
+                        last_seen = n.get('last_seen', '—')
+                        nodes_parsed.append({
+                            'id': str(node_id)[:12],
+                            'rssi': rssi_val,
+                            'last_seen': str(last_seen),
+                            'seen_ts': n.get('seen_ts', now_ts)
+                        })
+                    data['rnode_nodes'] = nodes_parsed
             cfg = get_params_from_config()
             if cfg:
                 with rnode_lock:
@@ -201,7 +227,9 @@ def update_network_loop():
             try:
                 r=subprocess.run(['ping','-c','1','-W','1',RNODE_HOST],capture_output=True,text=True,timeout=2)
                 ms='—'
-                if 'time=' in r.stdout: ms=f"{float(r.stdout.split('time=')[1].split()[0]):.0f}ms"
+                if 'time=' in r.stdout:
+                    time_part = r.stdout.split('time=')[1].split()[0]
+                    ms = f"{float(time_part):.0f}ms"
                 with data_lock: data['rnode'] = {'status':'online' if r.returncode==0 else 'offline','ping':ms,'last_check':datetime.now().strftime('%H:%M')}
             except: pass
         except: pass
@@ -215,22 +243,13 @@ def send_msg():
     if cmd_in_progress: return jsonify({'status': 'error', 'msg': 'Занято'}), 409
     cmd_in_progress = True
     try:
-        # Останавливаем слушатель, чтобы освободить порт
         subprocess.run(['pkill', '-f', 'meshtastic.*listen'], capture_output=True); time.sleep(2)
-        
         cmd = [MESHTASTIC_BIN, '--port', '/dev/meshtastic']
-        
-        # Формируем команду
         if dest:
-            # Личное сообщение
             cmd += ['--dest', f'!{dest}', '--sendtext', text]
         else:
-            # Общее сообщение (в Primary Channel). 
-            # В некоторых версиях CLI нужно явно указать --ch-index 0
             cmd += ['--ch-index', '0', '--sendtext', text]
-            
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-        
         if r.returncode == 0: 
             return jsonify({'status': 'ok', 'msg': '✅ Отправлено'})
         else:
@@ -255,16 +274,69 @@ def rnode_send():
 def rnode_mode_api():
     token = request.args.get('token') or (request.json.get('token') if request.is_json else '')
     if token != REBOOT_TOKEN: return jsonify({'status':'error','msg':'Access denied'}), 403
+    
     if request.method == 'GET': 
-        cfg = configparser.ConfigParser(); cfg.read(RNODE_CONFIG)
+        cfg = configparser.ConfigParser()
+        cfg.read(RNODE_CONFIG)
         mode = 'tcp'
         for sec in cfg.sections():
-            if cfg.get(sec, 'type', fallback='').lower() == 'rnodeinterface': mode = 'direct'
+            if cfg.get(sec, 'type', fallback='').lower() == 'rnodeinterface':
+                mode = 'direct'
+                break
         return jsonify({'current_mode': mode})
-    d = request.json or {}; mode = d.get('mode', '').lower()
-    if mode not in ['direct', 'tcp']: return jsonify({'status':'error'}), 400
-    # Логика переключения режимов (упрощена для стабильности)
-    return jsonify({'status':'ok','msg':'Mode switch requested'})
+    
+    # POST: Переключение режима
+    d = request.json or {}
+    mode = d.get('mode', '').lower()
+    if mode not in ['direct', 'tcp']:
+        return jsonify({'status':'error','msg':'Invalid mode'}), 400
+    
+    try:
+        cfg = configparser.ConfigParser()
+        cfg.read(RNODE_CONFIG)
+        
+        # Удаляем старые секции RNode/TCP
+        sections_to_remove = []
+        for sec in cfg.sections():
+            sec_type = cfg.get(sec, 'type', fallback='').lower()
+            if sec_type in ['rnodeinterface', 'tcpinterface', 'tcpclientinterface']:
+                sections_to_remove.append(sec)
+        for sec in sections_to_remove:
+            cfg.remove_section(sec)
+        
+        # Добавляем новую секцию
+        if mode == 'direct':
+            cfg['RNode Direct'] = {
+                'type': 'RNodeInterface',
+                'interface_enabled': 'yes',
+                'port': RNODE_PORT,
+                'baudrate': str(RNODE_BAUD),
+                'frequency': '868000000',
+                'bandwidth': '125000',
+                'spreading_factor': '7',
+                'coding_rate': '5',
+                'tx_power': '17'
+            }
+        else:  # tcp
+            cfg['RNode TCP'] = {
+                'type': 'TCPClientInterface',
+                'interface_enabled': 'yes',
+                'target_host': RNODE_HOST,
+                'target_port': '4242'
+            }
+        
+        # Сохраняем конфиг
+        with open(RNODE_CONFIG, 'w') as f:
+            cfg.write(f)
+        
+        # Перезапускаем сервис rnode-transport
+        subprocess.run(['sudo', 'systemctl', 'restart', 'rnode-transport'], 
+                      capture_output=True, timeout=10)
+        
+        return jsonify({'status':'ok','msg': f'Режим переключен на {mode.upper()}. Сервис перезапущен.'})
+    
+    except Exception as e:
+        return jsonify({'status':'error','msg': f'Ошибка переключения: {str(e)[:100]}'}), 500
 
 @app.route('/api/meshcmd', methods=['POST'])
 def meshcmd():
@@ -284,6 +356,72 @@ def meshcmd():
     except Exception as e: return jsonify({'status':'error','msg':str(e)})
     finally: cmd_in_progress=False
 
+def check_token():
+    token = request.args.get('token') or (request.json.get('token') if request.is_json else '')
+    return token == REBOOT_TOKEN
+
+@app.route('/api/restart_or_start_mesh_service', methods=['POST'])
+def restart_or_start_mesh_service():
+    if not check_token():
+        return jsonify({'status':'error','msg':'Access denied'}), 403
+    try:
+        running = is_process_running(MESHTASTIC_PATTERN)
+        subprocess.run(['pkill', '-f', MESHTASTIC_PATTERN], capture_output=True)
+        time.sleep(2)
+        subprocess.Popen([MESHTASTIC_BIN, '--port', '/dev/meshtastic', '--listen'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        msg = 'Meshtastic перезапущен' if running else 'Meshtastic запущен'
+        return jsonify({'status':'ok','msg': msg})
+    except Exception as e:
+        return jsonify({'status':'error','msg': str(e)})
+
+@app.route('/api/restart_or_start_rnode_service', methods=['POST'])
+def restart_or_start_rnode_service():
+    if not check_token():
+        return jsonify({'status':'error','msg':'Access denied'}), 403
+    try:
+        running = is_process_running('rnode')
+        subprocess.run(['pkill', '-f', 'rnode'], capture_output=True)
+        time.sleep(2)
+        subprocess.Popen(['rnode'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        msg = 'RNode перезапущен' if running else 'RNode запущен'
+        return jsonify({'status':'ok','msg': msg})
+    except Exception as e:
+        return jsonify({'status':'error','msg': str(e)})
+
+@app.route('/api/stop_mesh_service', methods=['POST'])
+def stop_mesh_service():
+    if not check_token(): return jsonify({'status':'error','msg':'Access denied'}), 403
+    try:
+        subprocess.run(['pkill', '-f', MESHTASTIC_PATTERN], capture_output=True)
+        return jsonify({'status': 'ok', 'msg': 'Meshtastic процесс остановлен'})
+    except Exception as e: return jsonify({'status': 'error', 'msg': str(e)})
+
+@app.route('/api/stop_rnode_service', methods=['POST'])
+def stop_rnode_service():
+    if not check_token(): return jsonify({'status':'error','msg':'Access denied'}), 403
+    try:
+        subprocess.run(['pkill', '-f', 'rnode'], capture_output=True)
+        return jsonify({'status': 'ok', 'msg': 'RNode процесс остановлен'})
+    except Exception as e: return jsonify({'status': 'error', 'msg': str(e)})
+
+@app.route('/api/send_location', methods=['POST'])
+def send_location():
+    if not check_token(): return jsonify({'status':'error','msg':'Access denied'}), 403
+    try:
+        subprocess.run(['pkill','-f','meshtastic.*listen'],capture_output=True)
+        time.sleep(1)
+        subprocess.run([MESHTASTIC_BIN,'--port','/dev/meshtastic','--setlat','0','--setlon','0'],capture_output=True,text=True,timeout=10)
+        return jsonify({'status':'ok','msg':'Location sent'})
+    except Exception as e: return jsonify({'status':'error','msg':str(e)})
+
+@app.route('/api/reboot_server', methods=['POST'])
+def reboot_server():
+    if not check_token(): return jsonify({'status':'error','msg':'Access denied'}), 403
+    try:
+        subprocess.Popen(['sudo','reboot'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        return jsonify({'status':'ok','msg':'Server reboot initiated'})
+    except Exception as e: return jsonify({'status':'error','msg':str(e)})
+
 @app.route('/data')
 def get_data():
     with data_lock: return jsonify(data)
@@ -293,7 +431,7 @@ def get_rnode():
     with rnode_lock: return jsonify(rnode_data)
 
 HTML = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Meshtastic Monitor v20.8</title><style>
+<title>Meshtastic Monitor v21</title><style>
 body{background:#0a0a0a;color:#e0e0e0;font-family:sans-serif;padding:10px}
 .hdr{background:#1a1a1a;padding:10px;border-radius:8px;margin-bottom:10px;text-align:center}
 .hdr-main{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;align-items:center;font-size:12px}
@@ -311,7 +449,7 @@ body{background:#0a0a0a;color:#e0e0e0;font-family:sans-serif;padding:10px}
 .msg-content{flex:1;min-width:0}.msg .t{color:#666;font-size:10px;margin-right:6px;white-space:nowrap}.msg .s{color:#ffb300;font-weight:600;margin-right:6px}
 .msg-act{cursor:pointer;margin-left:4px;opacity:0.7;font-size:11px;padding:2px 4px;border-radius:3px;background:#333;color:#fff}
 .msg-act:hover{opacity:1;background:#00c853;color:#000}
-.nd{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #222;font-size:12px;transition:opacity 0.3s}
+.nd{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #222;font-size:12px}
 .nd .id{color:#00c853;font-weight:600}.nd .subid{color:#666;font-size:10px;margin-left:6px}
 .bg{background:#222;padding:2px 6px;border-radius:4px;font-size:10px;margin-left:4px}
 .g{color:#4caf50}.o{color:#ff9800}.b{color:#f44336}.stale{background:#333!important;color:#777!important}
@@ -319,9 +457,10 @@ body{background:#0a0a0a;color:#e0e0e0;font-family:sans-serif;padding:10px}
 .ifc-card{background:#1a1a1a;padding:8px;margin:6px 0;border-radius:6px;border-left:3px solid #444}
 .ifc-card.up{border-left-color:#4caf50}.ifc-card .name{font-weight:600;color:#e0e0e0;font-size:12px}
 .ifc-card .meta{color:#888;font-size:11px;margin-top:2px}.ifc-card .traffic{color:#aaa;font-size:10px;margin-top:4px}
-.btn-lora{background:#b71c1c;color:#fff;border:none;padding:6px 10px;border-radius:5px;font-size:11px;cursor:pointer;margin-right:6px}
-.btn-lora.loc{background:#0d47a1}.btn-lora.mqtt{background:#6a1b9a}.btn-lora.off{background:#4a148c}
-.btn-lora:hover{opacity:0.9}.btn-row{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
+.cbtn{background:#2c3e50;color:#fff;border:none;padding:12px;border-radius:6px;cursor:pointer;font-size:12px;transition:0.2s}
+.cbtn:hover{background:#34495e;transform:translateY(-1px)}
+.cbtn.danger{background:#c0392b}.cbtn.danger:hover{background:#e74c3c}
+.cbtn.warn{background:#d35400}.cbtn.start{background:#27ae60}.cbtn.start:hover{background:#2ecc71}
 .reply-bar{background:#151515;border-top:1px solid #444;padding:10px;margin-top:10px;display:none;border-radius:0 0 8px 8px}
 .reply-bar.active{display:block}
 .quote-box{font-size:10px;color:#888;background:#222;padding:4px 6px;border-left:3px solid #00c853;margin-bottom:6px;white-space:pre-wrap;max-height:36px;overflow:hidden;opacity:0.8}
@@ -332,7 +471,7 @@ body{background:#0a0a0a;color:#e0e0e0;font-family:sans-serif;padding:10px}
 .reply-cancel{background:#444;color:#ccc;border:none;padding:6px 8px;border-radius:4px;font-size:11px;cursor:pointer}
 .reply-toggle{background:#333;color:#fff;border:none;padding:4px 8px;border-radius:4px;font-size:10px;cursor:pointer}
 .reply-toggle.active{background:#00c853;color:#000}
-</style>
+
 <style>
 #rnodeModeBtn { transition: all 0.3s ease; border: none; }
 #rnodeModeBtn.mode-direct { background-color: #0d47a1 !important; color: white !important; box-shadow: 0 0 8px rgba(13, 71, 161, 0.5); }
@@ -341,316 +480,142 @@ body{background:#0a0a0a;color:#e0e0e0;font-family:sans-serif;padding:10px}
 </style>
 </head><body>
 <div class="hdr"><div class="hdr-main">
-  <span id="st">⏳ Meshtastic</span><span id="bt">🔋?</span><span id="vt">⚡?</span><span id="wf">📶—</span>
-  <span id="rn">📡 RNode</span><span class="hdr-sep">|</span><span id="vp">🌐 VPN: —</span>
+<span id="st">⏳ Meshtastic</span><span id="bt">🔋?</span><span id="vt">⚡?</span><span id="wf">📶—</span>
+<span id="rn">📡 RNode</span><span class="hdr-sep">|</span><span id="vp">🌐 VPN: —</span>
 </div><div class="hdr-bot"><span id="rn_st" class="ok">● online</span> <span id="rn_pg">ping: —</span> <span id="rn_lc">check: —</span></div></div>
 <div class="flt"><button onclick="sf(0.5,this)">30м</button><button onclick="sf(1,this)">1ч</button><button onclick="sf(6,this)">6ч</button>
 <button class="a" onclick="sf(12,this)">12ч</button><button onclick="sf(24,this)">24ч</button><button onclick="sf(999,this)">Все</button></div>
-<div class="loc-bar">📟 <b id="loc_name">загрузка...</b> <span class="subid" id="loc_id">(!—)</span> | ⏱ В эфире: <span id="loc_time">—</span></div>
-<div class="card"><h3>📡 Meshtastic Node <span id="nc">0</span></h3><div id="nl" class="list">—</div></div>
+<div class="loc-bar">📟 <b id="loc_name">Loko</b> <span class="subid" id="loc_id">(!0a675cfe)</span> | ⏱ В эфире: <span id="loc_time">—</span></div>
+<div class="card"><h3>📡 Meshtastic Nodes <span id="nc">0</span></h3><div id="nl" class="list">—</div></div>
 <div class="card"><h3>💬 Meshtastic Chat <span id="mc">0</span></h3><div id="ml" class="list" style="padding-bottom:40px">—</div>
 <div class="reply-bar" id="replyBar">
-  <div style="font-size:10px;color:#00c853;margin-bottom:4px;display:none" id="replyModeLabel">💬 Ответ</div>
-  <div class="quote-box" id="quoteBox"></div>
-  <div class="reply-row">
-    <input type="text" id="replyInput" class="reply-input" placeholder="Введите ответ...">
-    <button class="reply-toggle active" id="quoteToggle" onclick="toggleQuote()">🔁 Цитата</button>
-    <button class="reply-send" onclick="sendReply()">➤</button>
-    <button class="reply-cancel" onclick="cancelReply()">✕</button>
-  </div>
-</div></div>
+<div style="font-size:10px;color:#00c853;margin-bottom:4px;display:none" id="replyModeLabel">💬 Ответ</div>
+<div class="quote-box" id="quoteBox"></div>
+<div class="reply-row">
+<input type="text" id="replyInput" class="reply-input" placeholder="Введите ответ...">
+<button class="reply-toggle active" id="quoteToggle" onclick="toggleQuote()">🔁 Цитата</button>
+<button class="reply-send" onclick="sendReply()">➤</button>
+<button class="reply-cancel" onclick="cancelReply()">✕</button>
+</div></div></div>
 <div class="card" id="rnodeCard">
-  <h3>💬 RNode Chat <span class="sub" id="rn_chat_status">⏳</span></h3>
-  <div style="display:flex;justify-content:flex-end;margin:-4px -4px 4px 0;gap:6px">
-    <button class="reply-toggle" onclick="toggleRNodeDetails()" style="padding:2px 6px;font-size:10px">⚙️ Детали</button>
-    <button id="rnodeModeBtn" class="reply-toggle mode-direct" onclick="switchRNodeMode()" style="padding:2px 6px;font-size:10px;background:#333;color:#fff">🔄 Загрузка...</button>
-  </div>
-  <div id="rnodeDetails" style="display:none;background:#111;padding:8px;border-radius:4px;margin:0 0 8px 0;font-size:11px;color:#aaa">
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
-      <div>📡 Порт: <b id="rd_port">—</b></div><div>⚡ Бод: <b id="rd_baud">—</b></div>
-      <div>📶 Частота: <b id="rd_freq">—</b></div><div>📏 BW: <b id="rd_bw">—</b></div>
-      <div>🔋 TX: <b id="rd_txp">—</b></div><div>🔀 SF/CR: <b id="rd_sfcr">—</b></div>
-      <div>📥 RX: <b id="rd_rxb">—</b></div><div>📤 TX: <b id="rd_txb">—</b></div>
-    </div>
-  </div>
-  <div id="rnode_msgs" class="list" style="max-height:20vh"><div style="padding:8px;color:#555">⏳ Ожидание сообщений...</div></div>
-  <div style="display:flex;gap:6px;margin-top:8px"><input type="text" id="rnode_input" class="reply-input" placeholder="Сообщение для RNode..." style="flex:1">
-    <button class="reply-send" onclick="sendRNode()">➤</button></div>
+<h3>💬 RNode Chat <span class="sub" id="rn_chat_status">⏳</span></h3>
+<div style="display:flex;justify-content:flex-end;margin:-4px -4px 4px 0;gap:6px">
+<button class="reply-toggle" onclick="toggleRNodeDetails()" style="padding:2px 6px;font-size:10px">⚙️ Детали</button>
+<button id="rnodeModeBtn" class="reply-toggle mode-direct" onclick="switchRNodeMode()" style="padding:2px 6px;font-size:10px;background:#333;color:#fff">🔄 Режим</button>
 </div>
-
-<div class="card">
-  <h3>📡 RNode Nodes <span id="rnc">0</span></h3>
-  <div class="flt" style="justify-content:flex-start;margin-bottom:4px">
-    <button onclick="srf(1,this)" class="a" style="font-size:10px;padding:2px 6px">1ч</button>
-    <button onclick="srf(12,this)" style="font-size:10px;padding:2px 6px">12ч</button>
-    <button onclick="srf(999,this)" style="font-size:10px;padding:2px 6px">Все</button>
-  </div>
-  <div id="rnl" class="list">—</div>
+<div id="rnodeDetails" style="display:none;background:#111;padding:8px;border-radius:4px;margin:0 0 8px 0;font-size:11px;color:#aaa">
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+<div>📡 Порт: <b>/dev/ttyACM1</b></div><div>⚡ Бод: <b>115200</b></div>
+<div>📶 Частота: <b id="rd_freq">—</b></div><div>📏 BW: <b id="rd_bw">—</b></div>
+<div>🔋 TX: <b id="rd_txp">—</b></div><div>🔀 SF/CR: <b id="rd_sfcr">—</b></div>
+<div>📥 RX: <b id="rd_rxb">—</b></div><div>📤 TX: <b id="rd_txb">—</b></div>
+</div></div>
+<div id="rnode_msgs" class="list" style="max-height:20vh"><div style="padding:8px;color:#555">⏳ Ожидание сообщений...</div></div>
+<div style="display:flex;gap:6px;margin-top:8px"><input type="text" id="rnode_input" class="reply-input" placeholder="Сообщение для RNode..." style="flex:1">
+<button class="reply-send" onclick="sendRNode()">➤</button></div></div>
+<div class="card"><h3>📡 RNode Nodes <span id="rnc">0</span></h3>
+<div class="flt" style="justify-content:flex-start;margin-bottom:4px">
+<button onclick="srf(1,this)" class="a" style="font-size:10px;padding:2px 6px">1ч</button>
+<button onclick="srf(12,this)" style="font-size:10px;padding:2px 6px">12ч</button>
+<button onclick="srf(999,this)" style="font-size:10px;padding:2px 6px">Все</button>
+</div><div id="rnl" class="list">—</div></div>
+<div class="card"><h3>🌐 RNode Interfaces <span class="sub" id="rn_upd">—</span></h3><div id="rn_details" class="list">—</div></div>
+<div class="card"><h3>📱 Device Control</h3>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+<button class="cbtn" onclick="rebootMeshtastic()">🔄 Restart Mesh</button>
+<button class="cbtn danger" onclick="poweroffMeshtastic()">⏻ Mesh Off</button>
+<button class="cbtn" onclick="rebootRNode()">🔄 Restart RNode</button>
+<button class="cbtn danger" onclick="poweroffRNode()">⏻ RNode Off</button>
+</div></div>
+<div class="card"><h3>⚙️ Service Control</h3>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+<button class="cbtn start" onclick="restartOrStartMeshService()">🔄▶ Restart/Start Mesh</button>
+<button class="cbtn start" onclick="restartOrStartRNodeService()">🔄▶ Restart/Start RNode</button>
+<button class="cbtn danger" onclick="stopMeshService()">⏹ Stop Mesh</button>
+<button class="cbtn danger" onclick="stopRNodeService()">⏹ Stop RNode</button>
 </div>
-
-<div class="card"><h3>🌐 RNode Interfaces <span class="sub" id="rn_upd">—</span></h3><div id="rn_details" class="list">—</div>
-
-<div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px; margin-top:15px;">
-    <button class="cbtn" onclick="rebootMeshtastic()">🔄 Restart Mesh</button>
-    <button class="cbtn danger" onclick="poweroffMeshtastic()">⏻ Mesh Off</button>
-    <button class="cbtn" onclick="rebootRNode()">🔄 Restart RNode</button>
-    <button class="cbtn danger" onclick="poweroffRNode()">⏻ RNode Off</button>
-    <button class="cbtn warn" onclick="sendLocation()">📍 Send Loc</button>
-    <button class="cbtn danger" onclick="rebootServer()">⚠️ Reboot Srv</button>
-</div>
-<style>
-.cbtn { background:#2c3e50; color:#fff; border:none; padding:12px; border-radius:6px; cursor:pointer; font-size:12px; transition:0.2s; }
-.cbtn:hover { background:#34495e; transform:translateY(-1px); }
-.cbtn.danger { background:#c0392b; }
-.cbtn.danger:hover { background:#e74c3c; }
-.cbtn.warn { background:#d35400; }
-</style>
-</div>
-
+<div style="margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px">
+<button class="cbtn warn" onclick="sendLocation()">📍 Send Loc</button>
+<button class="cbtn danger" onclick="rebootServer()">⚠️ Reboot Srv</button>
+</div></div>
 <script>
-let cf=12,$=id=>document.getElementById(id);
-let currentMessages = [];
-let reply = { destId: null, isPrivate: false, quote: true, quoteText: '', quoteSender: '' };
-function sc(v){if(!v)return'';let n=parseInt(v);return n>-60?'g':n>-90?'o':'b'}
-function up(){fetch('/data').then(r=>r.json()).then(d=>{
-$('st').innerText=(d.status||'').includes('Online')?'🟢 Meshtastic':'⏳ Meshtastic';$('bt').innerText=d.battery||'🔋?';$('vt').innerText=d.voltage||'⚡?';
-$('wf').innerText='📶'+(d.network?d.network.wifi_ip:'—');$('rn').innerText=(d.rnode&&d.rnode.status==='online')?'🟢 RNode':'🔴 RNode';
-$('vp').innerText='🌐 VPN: '+(d.network?d.network.vpn_ip:'—');$('rn_st').innerText='● '+d.rnode.status;$('rn_st').className=d.rnode.status==='online'?'ok':'err';
-$('rn_pg').innerText='ping: '+(d.rnode.ping||'—');$('rn_lc').innerText='check: '+(d.rnode.last_check||'—');
-let ln=d.local_node||{};$('loc_name').innerText=ln.name||'?';$('loc_id').innerText=ln.id?'(!'+ln.id+')':'';$('loc_time').innerText=ln.last_seen||'—';
-let now=Date.now()/1000, active=[], stale=[];
-for(let id in d.nodes){let i=d.nodes[id]; let age=(now-i.seen_ts)/3600; if(age<0)age=0;
-  if(cf!==999 && age>cf) continue;let entry={id:id, i:i, age:age};if(age>0.25) stale.push(entry); else active.push(entry);}
+const $=id=>document.getElementById(id),TOKEN="my_secret_reboot_token";
+let cf=12,currentMessages=[],reply={destId:null,isPrivate:false,quote:true,quoteText:"",quoteSender:""},rcf=12;
+function sc(v){if(!v)return"";let n=parseInt(v);return n>-60?"g":n>-90?"o":"b"}
+function up(){fetch("/data").then(r=>r.json()).then(d=>{
+$("st").innerText=(d.status||"").includes("Online")?"🟢 Meshtastic":"⏳ Meshtastic";$("bt").innerText=d.battery||"🔋?";$("vt").innerText=d.voltage||"⚡?";
+$("wf").innerText="📶"+(d.network?d.network.wifi_ip:"—");$("rn").innerText=(d.rnode&&d.rnode.status==="online")?"🟢 RNode":"🔴 RNode";
+$("vp").innerText="🌐 VPN: "+(d.network?d.network.vpn_ip:"—");$("rn_st").innerText="● "+d.rnode.status;$("rn_st").className=d.rnode.status==="online"?"ok":"err";
+$("rn_pg").innerText="ping: "+(d.rnode.ping||"—");$("rn_lc").innerText="check: "+(d.rnode.last_check||"—");
+let ln=d.local_node||{};$("loc_name").innerText=ln.name||"?";$("loc_id").innerText=ln.id?"(!"+ln.id+")":"";$("loc_time").innerText=ln.last_seen||"—";
+let now=Date.now()/1000,active=[],stale=[];
+for(let id in d.nodes){let i=d.nodes[id];let age=(now-i.seen_ts)/3600;if(age<0)age=0;if(cf!==999&&age>cf)continue;let entry={id:id,i:i,age:age};if(age>0.25)stale.push(entry);else active.push(entry);}
 active.sort((a,b)=>(parseInt(b.i.rssi)||-999)-(parseInt(a.i.rssi)||-999));stale.sort((a,b)=>b.age-a.age);
-let nodesArr=active.concat(stale);let n='', c=nodesArr.length;
-nodesArr.forEach(x=>{let i=x.i; let isStale=x.age>0.25;
-  let nameHtml=i.name?i.name+'<span class="subid">(!'+x.id+')</span>':'!'+x.id;
-  let rssiCls=isStale?'stale':sc(i.rssi);let rssiVal=i.rssi||'-';
-  let timeHtml=isStale?'<span style="color:#777">⏳'+i.last_seen+'</span>':i.last_seen;
-  let style=isStale?'opacity:0.55;':'';
-  n+='<div class="nd" style="'+style+'"><span class="id">'+nameHtml+'</span><span><span class="bg '+rssiCls+'">'+rssiVal+'dB</span><span class="bg">'+(i.snr?'SNR:'+i.snr:'')+'</span><span class="bg">'+timeHtml+'</span></span></div>';});
-$('nc').innerText=c;$('nl').innerHTML=n||'<div style="padding:8px;color:#555">Нет нод</div>';
-currentMessages = d.messages || [];let m='';
-currentMessages.forEach((x,idx)=>{m+='<div class="msg"><div class="msg-content"><span class="t">'+x.time+'</span><span class="s">'+x.sender+':</span>'+x.text+'</div>' +
-'<div style="display:flex;gap:4px"><span class="msg-act" onclick="openReply('+idx+', false)">↩️</span><span class="msg-act" style="background:#0d47a1" onclick="openReply('+idx+', true)">👤</span></div></div>';});
-$('mc').innerText=currentMessages.length;$('ml').innerHTML=m||'<div style="padding:8px;color:#555">Нет сообщений</div>';
-
-fetch('/api/rnode_data').then(r=>r.json()).then(rd=>{
-  $('rn_chat_status').innerText = rd.status || '⏳';
-  let rm=''; (rd.messages||[]).forEach(x=>{rm+='<div class="msg"><span class="t">'+x.time+'</span><span class="s">'+x.sender+':</span>'+x.text+'</div>';});
-  $('rnode_msgs').innerHTML = rm || '<div style="padding:8px;color:#555">⏳ Ожидание сообщений...</div>';
-  let mt = rd.metrics || {};
-  const fb = b => b>=1048576?(b/1048576).toFixed(1)+'MB':b>=1024?(b/1024).toFixed(1)+'KB':b+'B';
-  const fr = r => r>=1000000?(r/1000000).toFixed(1)+'Mbps':r>=1000?(r/1000).toFixed(0)+'kbps':r+'bps';
-  const fv = (v,u) => (v && v!=='?') ? v+u : '—';
-  $('rd_port').innerText = mt.port||'—'; $('rd_baud').innerText = mt.bitrate?fr(mt.bitrate):'—';
-  $('rd_freq').innerText = fv(mt.frequency,' MHz'); $('rd_bw').innerText = fv(mt.bandwidth,' kHz');
-  $('rd_txp').innerText = fv(mt.tx_power,' dBm'); 
-  $('rd_sfcr').innerText = (mt.sf!=='?'&&mt.cr!=='?') ? `SF${mt.sf}/CR ${mt.cr}` : '—';
-  $('rd_rxb').innerText = fb(mt.rxb||0); $('rd_txb').innerText = fb(mt.txb||0);
+let nodesArr=active.concat(stale),n="",c=nodesArr.length;
+nodesArr.forEach(x=>{let i=x.i,isStale=x.age>0.25;let nameHtml=i.name?i.name+"<span class='subid'>(!"+x.id+")</span>":"!"+x.id;let rssiCls=isStale?"stale":sc(i.rssi),rssiVal=i.rssi||"-";let timeHtml=isStale?"<span style='color:#777'>⏳"+i.last_seen+"</span>":i.last_seen;let style=isStale?"opacity:0.55;":"";n+="<div class='nd' style='"+style+"'><span class='id'>"+nameHtml+"</span><span><span class='bg "+rssiCls+"'>"+rssiVal+"dB</span><span class='bg'>"+(i.snr?"SNR:"+i.snr:"")+"</span><span class='bg'>"+timeHtml+"</span></span></div>";});
+$("nc").innerText=c;$("nl").innerHTML=n||"<div style='padding:8px;color:#555'>Нет нод</div>";
+currentMessages=d.messages||[];let m="";
+currentMessages.forEach((x,idx)=>{m+="<div class='msg'><div class='msg-content'><span class='t'>"+x.time+"</span><span class='s'>"+x.sender+":</span>"+x.text+"</div><div style='display:flex;gap:4px'><span class='msg-act' onclick='openReply("+idx+",false)'>↩️</span><span class='msg-act' style='background:#0d47a1' onclick='openReply("+idx+",true)'>👤</span></div></div>";});
+$("mc").innerText=currentMessages.length;$("ml").innerHTML=m||"<div style='padding:8px;color:#555'>Нет сообщений</div>";
+let ns=d.rnode_nodes||[],now2=Date.now()/1000,ac=ns.filter(n=>(rcf===999||(now2-n.seen_ts)/3600<=rcf)),h2="";
+ac.forEach(n=>{let rc=n.rssi==="?"?"":(parseInt(n.rssi)>-90?"g":"o");h2+="<div class='nd'><span class='id'>"+n.id+"</span><span><span class='bg "+rc+"'>"+n.rssi+"dB</span><span class='bg'>"+n.last_seen+"</span></span></div>";});
+$("rnc").innerText=ac.length;$("rnl").innerHTML=h2||"<div style='padding:8px;color:#555'>Нет узлов</div>";
+let ifcs=d.rnode_interfaces||[],tots=d.rnode_totals||{};$("rn_upd").innerText="↑"+tots.txb+" ↓"+tots.rxb;let h3="";if(ifcs.length===0)h3="<div style='padding:8px;color:#555'>Загрузка...</div>";else ifcs.forEach(i=>{h3+="<div class='ifc-card "+(i.status=="Up"?"up":"")+"'><div class='name'>"+i.name+"</div><div class='meta'>"+i.type+" | "+i.status+"</div><div class='traffic'>↑ "+i.tx+" | ↓ "+i.rx+"</div></div>";});$("rn_details").innerHTML=h3;
+})}
+function sf(h,btn){cf=h;document.querySelectorAll(".flt button").forEach(b=>b.classList.remove("a"));if(btn)btn.classList.add("a");up();}
+function srf(h,b){rcf=h;document.querySelectorAll(".flt button").forEach(x=>x.classList.remove("a"));if(b)b.classList.add("a");up();}
+function openReply(idx,isPrivate){if(!currentMessages[idx])return;let msg=currentMessages[idx];reply={destId:msg.sender_id,isPrivate:isPrivate,quote:!isPrivate,quoteText:msg.text,quoteSender:msg.sender};$("replyModeLabel").style.display="block";$("replyModeLabel").innerText=isPrivate?"📩 Личное: "+msg.sender:"💬 В общий чат";if(reply.quote){let t=msg.text.length>60?msg.text.substring(0,60)+"...":msg.text;$("quoteBox").innerText="> "+msg.sender+": "+t;$("quoteBox").style.display="block";$("quoteToggle").classList.add("active")}else{$("quoteBox").style.display="none";$("quoteToggle").classList.remove("active")}$("replyBar").classList.add("active");$("replyInput").value="";$("replyInput").focus()}
+function toggleQuote(){reply.quote=!reply.quote;if(reply.quote&&reply.quoteText){$("quoteBox").style.display="block";$("quoteToggle").classList.add("active")}else{$("quoteBox").style.display="none";$("quoteToggle").classList.remove("active")}}
+function cancelReply(){$("replyBar").classList.remove("active")}
+function sendReply(){let t=$("replyInput").value.trim();if(!t)return;let f=t;if(reply.quote&&reply.quoteText){let q=reply.quoteText.length>60?reply.quoteText.substring(0,60)+"...":reply.quoteText;f="> "+reply.quoteSender+": "+q+" | "+t}if(f.length>220)f=f.substring(0,217)+"...";let p={text:f};if(reply.isPrivate)p.dest=reply.destId;fetch("/api/sendmsg",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(p)}).then(r=>r.json()).then(res=>{alert(res.msg||"Отправлено");cancelReply();up()}).catch(e=>alert("Ошибка"))}
+function sendRNode(){let t=$("rnode_input").value.trim();if(!t)return;fetch("/api/rnode_msg",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:t})}).then(r=>r.json()).then(res=>{if(res.status=="ok"){$("rnode_input").value="";up()}}).catch(e=>alert("Ошибка"))}
+function toggleRNodeDetails(){let e=document.getElementById("rnodeDetails");if(e)e.style.display=e.style.display==="none"?"block":"none"}
+function rebootMeshtastic(){if(!confirm("Restart Mesh device?"))return;fetch("/api/meshcmd?action=reboot&token="+TOKEN,{method:"POST"}).then(r=>r.json()).then(d=>alert(d.msg))}
+function poweroffMeshtastic(){if(!confirm("Stop Mesh device?"))return;fetch("/api/meshcmd?action=shutdown&token="+TOKEN,{method:"POST"}).then(r=>r.json()).then(d=>alert(d.msg))}
+function rebootRNode(){if(!confirm("Restart RNode device?"))return;fetch("/api/restart_or_start_rnode_service?token="+TOKEN,{method:"POST"}).then(r=>r.json()).then(d=>{alert(d.msg);setTimeout(()=>location.reload(),2000)})}
+function poweroffRNode(){if(!confirm("Stop RNode device?"))return;fetch("/api/stop_rnode_service?token="+TOKEN,{method:"POST"}).then(r=>r.json()).then(d=>alert(d.msg))}
+function restartOrStartMeshService(){if(!confirm("Restart/Start Mesh process?"))return;fetch("/api/restart_or_start_mesh_service?token="+TOKEN,{method:"POST"}).then(r=>r.json()).then(d=>alert(d.msg))}
+function restartOrStartRNodeService(){if(!confirm("Restart/Start RNode process?"))return;fetch("/api/restart_or_start_rnode_service?token="+TOKEN,{method:"POST"}).then(r=>r.json()).then(d=>alert(d.msg))}
+function stopMeshService(){if(!confirm("Stop Mesh process?"))return;fetch("/api/stop_mesh_service?token="+TOKEN,{method:"POST"}).then(r=>r.json()).then(d=>alert(d.msg))}
+function stopRNodeService(){if(!confirm("Stop RNode process?"))return;fetch("/api/stop_rnode_service?token="+TOKEN,{method:"POST"}).then(r=>r.json()).then(d=>alert(d.msg))}
+function sendLocation(){fetch("/api/send_location?token="+TOKEN,{method:"POST"}).then(r=>r.json()).then(d=>alert(d.msg))}
+function rebootServer(){if(!confirm("REBOOT SERVER?"))return;fetch("/api/reboot_server?token="+TOKEN,{method:"POST"}).then(r=>r.json()).then(d=>alert(d.msg))}
+fetch("/api/rnode_data").then(r=>r.json()).then(rd=>{
+$("rn_chat_status").innerText=rd.status||"⏳";
+let mt=rd.metrics||{};
+const fv=(v,u)=>(v&&v!=="?")?v+u:"—";
+$("rd_freq").innerText=fv(mt.frequency," MHz");$("rd_bw").innerText=fv(mt.bandwidth," kHz");
+$("rd_txp").innerText=fv(mt.tx_power," dBm");
+$("rd_sfcr").innerText=(mt.sf!=="?"&&mt.cr!=="?")?"SF"+mt.sf+"/CR "+mt.cr:"—";
+const fb=b=>b>=1048576?(b/1048576).toFixed(1)+"MB":b>=1024?(b/1024).toFixed(1)+"KB":b+"B";
+$("rd_rxb").innerText=fb(mt.rxb||0);$("rd_txb").innerText=fb(mt.txb||0);
 });
-
-updateRNodeNodes(d);
-let ifcs=d.rnode_interfaces||[],tots=d.rnode_totals||{};$('rn_upd').innerText='↑'+tots.txb+' ↓'+tots.rxb;
-let h='';if(ifcs.length===0)h='<div style="padding:8px;color:#555">Загрузка...</div>';else ifcs.forEach(i=>{h+='<div class="ifc-card '+(i.status=='Up'?'up':'')+'"><div class="name">'+i.name+'</div><div class="meta">'+i.type+' | '+i.status+'</div><div class="traffic">↑ '+i.tx+' | ↓ '+i.rx+'</div></div>';});
-$('rn_details').innerHTML=h;})}
-function sf(h,btn){cf=h;document.querySelectorAll('.flt button').forEach(b=>b.classList.remove('a'));if(btn)btn.classList.add('a');up();}
-function openReply(idx, isPrivate=false){
-  if(!currentMessages[idx]) return;
-  let msg = currentMessages[idx];
-  reply = { destId: msg.sender_id, isPrivate: isPrivate, quote: !isPrivate, quoteText: msg.text, quoteSender: msg.sender };
-  $('replyModeLabel').style.display = 'block';
-  $('replyModeLabel').innerText = isPrivate ? '📩 Личное: '+msg.sender : '💬 В общий чат';
-  if(reply.quote){
-    let t = msg.text.length>60 ? msg.text.substring(0,60)+'...' : msg.text;
-    $('quoteBox').innerText = '> '+msg.sender+': '+t;
-    $('quoteBox').style.display = 'block';
-    $('quoteToggle').classList.add('active');
-  } else {
-    $('quoteBox').style.display = 'none';
-    $('quoteToggle').classList.remove('active');
-  }
-  $('replyBar').classList.add('active');
-  $('replyInput').value = ''; $('replyInput').focus();
+function toggleRNodeDetails(){let e=document.getElementById("rnodeDetails");if(e)e.style.display=e.style.display==="none"?"block":"none"}
+function switchRNodeMode(){
+let btn=document.getElementById("rnodeModeBtn");
+if(!btn)return;
+let next=btn.innerText.includes("Direct")?"tcp":"direct";
+if(!confirm("Переключить на "+next.toUpperCase()+"?"))return;
+btn.innerText="⏳...";btn.disabled=true;
+fetch("/api/rnode_mode?token="+TOKEN,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mode:next})})
+.then(r=>r.json()).then(res=>{alert(res.msg);setTimeout(()=>location.reload(),2500)})
+.catch(e=>{alert("Ошибка");btn.disabled=false;});
 }
-function toggleQuote(){
-  reply.quote = !reply.quote;
-  if(reply.quote && reply.quoteText){
-    $('quoteBox').style.display = 'block'; $('quoteToggle').classList.add('active');
-  } else {
-    $('quoteBox').style.display = 'none'; $('quoteToggle').classList.remove('active');
-  }
+function loadRNodeMode(){
+fetch("/api/rnode_mode?token="+TOKEN).then(r=>r.json()).then(d=>{
+let btn=document.getElementById("rnodeModeBtn");
+if(!btn)return;
+if(d.current_mode==="direct"){btn.innerText="🔌 Direct";btn.classList.add("mode-direct")}
+else{btn.innerText="🌐 TCP";btn.classList.add("mode-tcp")}
+});
 }
-function cancelReply(){ $('replyBar').classList.remove('active'); }
-function sendReply(){
-  let t = $('replyInput').value.trim(); if(!t) return;
-  let f = t;
-  if(reply.quote && reply.quoteText){
-    let q = reply.quoteText.length>60 ? reply.quoteText.substring(0,60)+'...' : reply.quoteText;
-    f = '> '+reply.quoteSender+': '+q+' | '+t;
-  }
-  if(f.length>220) f = f.substring(0,217)+'...';
-  let payload = {text: f};
-  if(reply.isPrivate) payload.dest = reply.destId;
-  fetch('/api/sendmsg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
-  .then(r=>r.json()).then(res=>{alert(res.msg||'Отправлено'); cancelReply(); up();}).catch(e=>alert('Ошибка'));
-}
-function sendRNode(){let t=$('rnode_input').value.trim();if(!t)return;
-  fetch('/api/rnode_msg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})})
-  .then(r=>r.json()).then(res=>{if(res.status=='ok'){$('rnode_input').value='';up()}}).catch(e=>alert('Ошибка'));}
-function toggleRNodeDetails(){let e=document.getElementById('rnodeDetails');e.style.display=e.style.display==='none'?'block':'none';}
-function switchRNodeMode(){alert('Переключение режима временно недоступно в этой версии');}
-function meshCmd(action){let m={reboot:'Перезагрузить?',shutdown:'Выключить?',send_location:'Отправить координаты?',mqtt_tls_off:'Отключить TLS MQTT?'};
-  if(!confirm('⚠️ '+(m[action]||'Продолжить?')))return;
-  fetch(`/api/meshcmd?action=${action}&token=my_secret_reboot_token`,{method:'POST'}).then(r=>r.json()).then(d=>alert(d.msg||'Готово'));}
-const REBOOT_TOKEN = 'my_secret_reboot_token';
+setTimeout(loadRNodeMode,500);
 setInterval(up,3000);up();
-</script>
-<script>
-// --- Логика RNode Nodes ---
-let rcf=12;
-function srf(h,b){rcf=h;document.querySelectorAll('.flt button').forEach(x=>x.classList.remove('a'));if(b)b.classList.add('a');up();}
-function updateRNodeNodes(d){
-    let ns=d.rnode_nodes||[];
-    let now=Date.now()/1000;
-    let ac=ns.filter(n=>(rcf===999||(now-n.seen_ts)/3600<=rcf));
-    let h='';
-    ac.forEach(n=>{
-        let rc = n.rssi==='?' ? '' : (parseInt(n.rssi)>-90 ? 'g' : 'o');
-        h += '<div class="nd"><span class="id">'+n.id+'</span><span><span class="bg '+rc+'">'+n.rssi+'dB</span><span class="bg">'+n.last_seen+'</span></span></div>';
-    });
-    $('rnc').innerText=ac.length;
-    $('rnl').innerHTML=h || '<div style="padding:8px;color:#555">Нет узлов</div>';
-}
-
-// --- Логика Кнопки Режим ---
-(function() {
-    const TOKEN = 'my_secret_reboot_token';
-    function updateBtn(mode) {
-        console.log("Setting mode to:", mode);
-        let btn = document.getElementById('rnodeModeBtn');
-        if (!btn) return;
-        btn.innerText = mode === 'direct' ? '🔌 Direct' : '🌐 TCP';
-        btn.style.background = mode === 'direct' ? '#0d47a1' : '#6a1b9a';
-    }
-    
-    
-    setTimeout(loadRNodeMode, 1000);
-})();
-
-// --- Функции кнопок управления ---
-function rebootMeshtastic() { if(!confirm('Restart Meshtastic?')) return; fetch('/api/reboot_meshtastic?token='+REBOOT_TOKEN, {method:'POST'}).then(r=>r.json()).then(d=>alert(d.msg)); }
-function poweroffMeshtastic() { if(!confirm('Stop Meshtastic?')) return; fetch('/api/poweroff_lora?token='+REBOOT_TOKEN, {method:'POST'}).then(r=>r.json()).then(d=>alert(d.msg)); }
-function rebootRNode() { if(!confirm('Restart RNode?')) return; fetch('/api/reboot_rnode?token='+REBOOT_TOKEN, {method:'POST'}).then(r=>r.json()).then(d=>{ alert(d.msg); setTimeout(()=>location.reload(), 2000); }); }
-function poweroffRNode() { if(!confirm('Stop RNode?')) return; fetch('/api/poweroff_rnode?token='+REBOOT_TOKEN, {method:'POST'}).then(r=>r.json()).then(d=>alert(d.msg)); }
-function sendLocation() { fetch('/api/send_location?token='+REBOOT_TOKEN, {method:'POST'}).then(r=>r.json()).then(d=>alert(d.msg)); }
-function rebootServer() { if(!confirm('REBOOT SERVER?')) return; fetch('/api/reboot_server?token='+REBOOT_TOKEN, {method:'POST'}).then(r=>r.json()).then(d=>alert(d.msg)); }
-</script>
-
-
-<style>
-/* Принудительные цвета для кнопки режима */
-button#rnodeModeBtn { transition: background 0.3s; }
-</style>
-<script>
-// Переопределяем функцию updateBtn глобально
-window.updateBtn = function(mode) {
-    let btn = document.getElementById('rnodeModeBtn');
-    if (!btn) return;
-    if (mode === 'direct') {
-        btn.innerText = '🔌 Direct';
-        btn.style.backgroundColor = '#0d47a1';
-        btn.style.color = '#fff';
-        // Пробуем через атрибут style напрямую
-        btn.setAttribute('style', 'padding:2px 6px;font-size:10px;background:#0d47a1 !important;color:#fff !important;');
-    } else {
-        btn.innerText = '🌐 TCP';
-        btn.style.backgroundColor = '#6a1b9a';
-        btn.style.color = '#fff';
-        btn.setAttribute('style', 'padding:2px 6px;font-size:10px;background:#6a1b9a !important;color:#fff !important;');
-    }
-    console.log("Force color applied:", mode);
-}
-</script>
-
-<script>
-// --- Логика Кнопки Режим ---
-function updateBtn(mode) {
-    let btn = document.getElementById('rnodeModeBtn');
-    if (!btn) { console.log("Btn not found"); return; }
-    
-    console.log("Applying mode:", mode);
-    
-    if (mode === 'direct') {
-        btn.innerText = '🔌 Direct';
-        // Прямое изменение стиля с !important
-        btn.style.setProperty('background-color', '#0d47a1', 'important');
-        btn.style.setProperty('color', '#ffffff', 'important');
-        btn.style.setProperty('border-color', '#0d47a1', 'important');
-    } else {
-        btn.innerText = '🌐 TCP';
-        // Прямое изменение стиля с !important
-        btn.style.setProperty('background-color', '#6a1b9a', 'important');
-        btn.style.setProperty('color', '#ffffff', 'important');
-        btn.style.setProperty('border-color', '#6a1b9a', 'important');
-    }
-    console.log("Style applied. Current bg:", btn.style.backgroundColor);
-}
-
-window.loadRNodeMode = function() {
-    fetch('/api/rnode_mode?token=my_secret_reboot_token')
-    .then(r => r.json())
-    .then(d => { 
-        if(d.current_mode) {
-            updateBtn(d.current_mode);
-            console.log("Mode loaded:", d.current_mode);
-        }
-    })
-    .catch(e => console.error("Mode load error:", e));
-};
-
-window.switchRNodeMode = function() {
-    let btn = document.getElementById('rnodeModeBtn');
-    if(!btn) return;
-    
-    let currentText = btn.innerText;
-    let next = currentText.includes('Direct') ? 'tcp' : 'direct';
-    
-    if (!confirm('Переключить режим на ' + next.toUpperCase() + '? Сервис перезагрузится.')) return;
-    
-    btn.innerText = '⏳ ...';
-    btn.disabled = true;
-    btn.classList.remove('mode-direct', 'mode-tcp');
-    btn.style.background = '#555';
-    
-    fetch('/api/rnode_mode?token=my_secret_reboot_token', {
-        method:'POST', 
-        headers:{'Content-Type':'application/json'}, 
-        body:JSON.stringify({mode:next})
-    })
-    .then(r=>r.json())
-    .then(res=>{ 
-        alert(res.msg); 
-        setTimeout(()=>location.reload(), 2500); 
-    })
-    .catch(e=>{ 
-        alert('Ошибка переключения'); 
-        btn.disabled=false; 
-        loadRNodeMode(); 
-    });
-};
-
-// Запуск при загрузке
-document.addEventListener('DOMContentLoaded', function() {
-    setTimeout(loadRNodeMode, 500);
-});
-</script>
-
-</body></html>'''
+</script></body></html>'''
 
 @app.route('/')
-def index(): return render_template_string(HTML)
-
+def index():
+    return render_template_string(HTML)
 
 def preload_node_names():
     print("🔄 Загрузка имен из истории...")
@@ -681,5 +646,5 @@ if __name__=='__main__':
     threading.Thread(target=rnode_reader_loop, daemon=True).start()
     threading.Thread(target=metrics_loop, daemon=True).start()
     threading.Thread(target=update_network_loop, daemon=True).start()
-    print("✅ Запуск v20.8 (Full Restore)...")
+    print("✅ Запуск v21.0 (Final Fixed)...")
     app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
