@@ -22,7 +22,7 @@ data = {'messages':[],'nodes':{},'battery':'?','voltage':'?','status':'⏳ За�
         'network':{'wifi_ip':'—','vpn_ip':'—'},
         'rnode':{'status':'unknown','ping':'—','last_check':'—'},
         'rnode_interfaces':[], 'rnode_totals':{}, 'rnode_nodes': [],
-        'local_node':{'name':'Loko','id':'0a675cfe','last_seen':datetime.now().strftime('%H:%M')}}
+        'local_node':{'name':'Lokomotiv','id':'8fa6399c','last_seen':datetime.now().strftime('%H:%M')}}
 data_lock = threading.Lock()
 seen_texts = set()
 cmd_in_progress = False
@@ -43,7 +43,7 @@ def decode_payload(line):
     tm = re.search(r"'text':\s*'((?:\\.|[^'])*)'", line)
     if tm:
         txt = tm.group(1).replace('\\n', ' ').replace('\\t', ' ').strip()
-        if txt and len(txt) >= 2: return txt
+        if txt and len(txt) >= 1: return txt
     for q in ["'", '"']:
         m = re.search(r"payload:\s*b" + q + r"((?:\\.|[^" + q + r"])*)", line)
         if not m: continue
@@ -58,7 +58,7 @@ def decode_payload(line):
                 i += 1
         try:
             txt = res.decode('utf-8', errors='ignore').strip()
-            if txt and len(txt) >= 2 and 'proto' not in txt.lower(): return txt
+            if txt and len(txt) >= 1 and 'proto' not in txt.lower(): return txt
         except: pass
     return None
 
@@ -86,7 +86,8 @@ def is_process_running(pattern):
 
 def reader_loop():
     global seen_texts
-    last_pos = os.path.getsize(DATA_FILE) if os.path.exists(DATA_FILE) else 0
+    last_from_id = None
+    last_pos = 0
     while True:
         try:
             if not os.path.exists(DATA_FILE): time.sleep(2); continue
@@ -116,6 +117,7 @@ def reader_loop():
                 fid_m = re.search(r"'fromId':\s*'!?([a-f0-9]+)'", line)
                 if fid_m:
                     fid = fid_m.group(1)
+                    last_from_id = fid
                     rssi_m = re.search(r"'rxRssi':\s*(-?\d+)", line)
                     snr_m = re.search(r"'rxSnr':\s*(-?\d+\.?\d*)", line)
                     bat = re.search(r"battery_level[:\s]+(\d+)", line)
@@ -133,13 +135,19 @@ def reader_loop():
                         data['status'] = '🟢 Online'
 
                 text = decode_payload(line)
-                if text and fid_m and len(text) >= 2:
+                if text and fid_m and len(text) >= 1:
                     key = f"{fid}:{text}"
                     if key not in seen_texts:
                         seen_texts.add(key)
+                        toId = '^all'
+                        toId_m = re.search(r"'toId':\s*'!?([a-f0-9\^]+)'", line)
+                        if toId_m: toId = toId_m.group(1)
                         sender = data['nodes'].get(fid, {}).get('name', fid[:6])
                         with data_lock:
-                            data['messages'].insert(0, {'time': datetime.now().strftime('%H:%M:%S'), 'text': text, 'sender': sender, 'sender_id': fid})
+                            if fid in data['nodes']:
+                                data['nodes'][fid]['seen_ts'] = time.time()
+                                data['nodes'][fid]['last_seen'] = ts
+                            data['messages'].insert(0, {'time': datetime.now().strftime('%H:%M:%S'), 'text': text, 'sender': sender, 'sender_id': fid, 'toId': toId})
                             if len(data['messages']) > 50: data['messages'] = data['messages'][:50]
         except Exception as e:
             with open('/home/alex/mesh_err.log', 'a') as f: f.write(f"{datetime.now()}: {e}\n")
@@ -162,7 +170,7 @@ def rnode_reader_loop():
                     if len(f) > 1 and f[0] == 0x00:
                         try:
                             text = f[1:].decode('utf-8', errors='ignore').strip()
-                            if text and len(text) >= 2:
+                            if text and len(text) >= 1:
                                 with rnode_lock:
                                     rnode_data['messages'].insert(0, {'time': datetime.now().strftime('%H:%M:%S'), 'text': text, 'sender': 'RNode'})
                                     if len(rnode_data['messages']) > 50: rnode_data['messages'] = rnode_data['messages'][:50]
@@ -243,14 +251,26 @@ def send_msg():
     if cmd_in_progress: return jsonify({'status': 'error', 'msg': 'Занято'}), 409
     cmd_in_progress = True
     try:
-        subprocess.run(['pkill', '-f', 'meshtastic.*listen'], capture_output=True); time.sleep(2)
+        subprocess.run(['pkill', '-f', 'meshtastic.*--port.*/dev/meshtastic.*--listen'], capture_output=True); time.sleep(2)
         cmd = [MESHTASTIC_BIN, '--port', '/dev/meshtastic']
         if dest:
             cmd += ['--dest', f'!{dest}', '--sendtext', text]
         else:
             cmd += ['--ch-index', '0', '--sendtext', text]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-        if r.returncode == 0: 
+        if r.returncode == 0:
+            # Сохраняем отправленное сообщение
+            with data_lock:
+                data['messages'].insert(0, {
+                    'time': datetime.now().strftime('%H:%M:%S'),
+                    'text': text,
+                    'sender': 'Я (Lokomotiv)',
+                    'sender_id': '8fa6399c',
+                    'toId': dest if dest else '^all',
+                    'sent': True
+                })
+                if len(data['messages']) > 50:
+                    data['messages'] = data['messages'][:50]
             return jsonify({'status': 'ok', 'msg': '✅ Отправлено'})
         else:
             err = r.stderr.strip() if r.stderr else "Unknown error"
@@ -274,28 +294,18 @@ def rnode_send():
 def rnode_mode_api():
     token = request.args.get('token') or (request.json.get('token') if request.is_json else '')
     if token != REBOOT_TOKEN: return jsonify({'status':'error','msg':'Access denied'}), 403
-    
     if request.method == 'GET': 
-        cfg = configparser.ConfigParser()
-        cfg.read(RNODE_CONFIG)
+        cfg = configparser.ConfigParser(); cfg.read(RNODE_CONFIG)
         mode = 'tcp'
         for sec in cfg.sections():
-            if cfg.get(sec, 'type', fallback='').lower() == 'rnodeinterface':
-                mode = 'direct'
-                break
+            if cfg.get(sec, 'type', fallback='').lower() == 'rnodeinterface': mode = 'direct'
         return jsonify({'current_mode': mode})
-    
+    d = request.json or {}; mode = d.get('mode', '').lower()
+    if mode not in ['direct', 'tcp']: return jsonify({'status':'error'}), 400
     # POST: Переключение режима
-    d = request.json or {}
-    mode = d.get('mode', '').lower()
-    if mode not in ['direct', 'tcp']:
-        return jsonify({'status':'error','msg':'Invalid mode'}), 400
-    
     try:
         cfg = configparser.ConfigParser()
         cfg.read(RNODE_CONFIG)
-        
-        # Удаляем старые секции RNode/TCP
         sections_to_remove = []
         for sec in cfg.sections():
             sec_type = cfg.get(sec, 'type', fallback='').lower()
@@ -303,40 +313,24 @@ def rnode_mode_api():
                 sections_to_remove.append(sec)
         for sec in sections_to_remove:
             cfg.remove_section(sec)
-        
-        # Добавляем новую секцию
         if mode == 'direct':
             cfg['RNode Direct'] = {
-                'type': 'RNodeInterface',
-                'interface_enabled': 'yes',
-                'port': RNODE_PORT,
-                'baudrate': str(RNODE_BAUD),
-                'frequency': '868000000',
-                'bandwidth': '125000',
-                'spreading_factor': '7',
-                'coding_rate': '5',
-                'tx_power': '17'
+                'type': 'RNodeInterface', 'interface_enabled': 'yes',
+                'port': RNODE_PORT, 'baudrate': str(RNODE_BAUD),
+                'frequency': '868000000', 'bandwidth': '125000',
+                'spreading_factor': '7', 'coding_rate': '5', 'tx_power': '17'
             }
-        else:  # tcp
+        else:
             cfg['RNode TCP'] = {
-                'type': 'TCPClientInterface',
-                'interface_enabled': 'yes',
-                'target_host': RNODE_HOST,
-                'target_port': '4242'
+                'type': 'TCPClientInterface', 'interface_enabled': 'yes',
+                'target_host': RNODE_HOST, 'target_port': '4242'
             }
-        
-        # Сохраняем конфиг
         with open(RNODE_CONFIG, 'w') as f:
             cfg.write(f)
-        
-        # Перезапускаем сервис rnode-transport
-        subprocess.run(['sudo', 'systemctl', 'restart', 'rnode-transport'], 
-                      capture_output=True, timeout=10)
-        
-        return jsonify({'status':'ok','msg': f'Режим переключен на {mode.upper()}. Сервис перезапущен.'})
-    
+        subprocess.run(['sudo', 'systemctl', 'restart', 'rnode-transport'], capture_output=True, timeout=10)
+        return jsonify({'status':'ok','msg': f'Режим переключен на {mode.upper()}'})
     except Exception as e:
-        return jsonify({'status':'error','msg': f'Ошибка переключения: {str(e)[:100]}'}), 500
+        return jsonify({'status':'error','msg': str(e)[:100]}), 500
 
 @app.route('/api/meshcmd', methods=['POST'])
 def meshcmd():
@@ -359,6 +353,49 @@ def meshcmd():
 def check_token():
     token = request.args.get('token') or (request.json.get('token') if request.is_json else '')
     return token == REBOOT_TOKEN
+
+@app.route('/api/restart_rnode_port', methods=['POST'])
+def restart_rnode_port():
+    global rnode_ser
+    if not check_token():
+        return jsonify({'status':'error','msg':'Access denied'}), 403
+    try:
+        with rnode_lock:
+            if rnode_ser and rnode_ser.is_open:
+                rnode_ser.close()
+                rnode_ser = None
+                time.sleep(1)
+            rnode_data['status'] = '🔄 Переподключение...'
+        return jsonify({'status':'ok','msg':'RNode порт переподключен'})
+    except Exception as e:
+        return jsonify({'status':'error','msg': str(e)[:80]}), 500
+
+@app.route('/api/stop_rnode_port', methods=['POST'])
+def stop_rnode_port():
+    global rnode_ser
+    if not check_token():
+        return jsonify({'status':'error','msg':'Access denied'}), 403
+    try:
+        with rnode_lock:
+            if rnode_ser and rnode_ser.is_open:
+                rnode_ser.close()
+                rnode_ser = None
+                rnode_data['status'] = '⏹ Порт закрыт'
+        return jsonify({'status':'ok','msg':'RNode порт закрыт'})
+    except Exception as e:
+        return jsonify({'status':'error','msg': str(e)[:80]}), 500
+
+@app.route('/api/stop_mesh_process', methods=['POST'])
+def stop_mesh_process():
+    if not check_token():
+        return jsonify({'status':'error','msg':'Access denied'}), 403
+    try:
+        subprocess.run(['pkill','-f','meshtastic.*listen'],capture_output=True)
+        subprocess.run(['pkill','-f','tee.*meshtastic_output'],capture_output=True)
+        return jsonify({'status':'ok','msg':'Meshtastic процессы остановлены'})
+    except Exception as e:
+        return jsonify({'status':'error','msg': str(e)})
+
 
 @app.route('/api/restart_or_start_mesh_service', methods=['POST'])
 def restart_or_start_mesh_service():
@@ -422,6 +459,163 @@ def reboot_server():
         return jsonify({'status':'ok','msg':'Server reboot initiated'})
     except Exception as e: return jsonify({'status':'error','msg':str(e)})
 
+@app.route('/api/mesh_info', methods=['GET'])
+def mesh_info():
+    import re as _re
+    try:
+        with open(DATA_FILE, 'r') as f:
+            lines = f.readlines()[-1000:]
+        info = '\n'.join(lines)
+    except:
+        info = ''
+    return jsonify({
+        'fw': (_re.search(r'firmware_version: "([^"]+)"', info) or ['','—'])[1],
+        'hw': (_re.search(r'hw_model: (\d+)', info) or ['','—'])[1],
+        'role': (_re.search(r'"role": "([^"]+)"', info) or ['','—'])[1],
+        'region': (_re.search(r'region: (\w+)', info) or ['','—'])[1],
+        'bw': (_re.search(r'bandwidth: (\d+)', info) or ['','—'])[1],
+        'sf': (_re.search(r'spread_factor: (\d+)', info) or ['','—'])[1],
+        'cr': (_re.search(r'coding_rate: (\d+)', info) or ['','—'])[1],
+        'tx': (_re.search(r'tx_power: (\d+)', info) or ['','—'])[1],
+        'ch': (_re.search(r'channel_num: (\d+)', info) or ['','—'])[1],
+        'freq': (_re.search(r'override_frequency: ([\d.]+)', info) or ['','—'])[1]
+    })
+@app.route('/api/toggle_mqtt', methods=['POST'])
+def toggle_mqtt():
+    if not check_token():
+        return jsonify({'status':'error','msg':'Access denied'}), 403
+    try:
+        subprocess.run(['systemctl','stop','mesh-collector'],capture_output=True)
+        subprocess.run(['pkill','-f','meshtastic.*listen'],capture_output=True)
+        time.sleep(2)
+        r = subprocess.run([MESHTASTIC_BIN,'--port','/dev/meshtastic','--get','mqtt'],capture_output=True,text=True,timeout=10)
+        current = 'mqtt.enabled: true' in r.stdout or 'mqtt.enabled: True' in r.stdout
+        new_val = 'false' if current else 'true'
+        subprocess.run([MESHTASTIC_BIN,'--port','/dev/meshtastic','--set','mqtt.enabled',new_val],capture_output=True,text=True,timeout=10)
+        subprocess.run(['systemctl','start','mesh-collector'],capture_output=True)
+        return jsonify({'status':'ok','mqtt': not current})
+    except Exception as e:
+        subprocess.run(['systemctl','start','mesh-collector'],capture_output=True)
+        return jsonify({'status':'error','msg': str(e)[:100]}), 500
+
+@app.route('/api/toggle_mqtt_tls', methods=['POST'])
+def toggle_mqtt_tls():
+    if not check_token():
+        return jsonify({'status':'error','msg':'Access denied'}), 403
+    try:
+        subprocess.run(['systemctl','stop','mesh-collector'],capture_output=True)
+        subprocess.run(['pkill','-f','meshtastic.*listen'],capture_output=True)
+        time.sleep(2)
+        r = subprocess.run([MESHTASTIC_BIN,'--port','/dev/meshtastic','--get','mqtt'],capture_output=True,text=True,timeout=10)
+        current = 'mqtt.tls_enabled: true' in r.stdout or 'mqtt.tls_enabled: True' in r.stdout
+        new_val = 'false' if current else 'true'
+        subprocess.run([MESHTASTIC_BIN,'--port','/dev/meshtastic','--set','mqtt.tls_enabled',new_val],capture_output=True,text=True,timeout=10)
+        subprocess.run(['systemctl','start','mesh-collector'],capture_output=True)
+        return jsonify({'status':'ok','tls': not current})
+    except Exception as e:
+        subprocess.run(['systemctl','start','mesh-collector'],capture_output=True)
+        return jsonify({'status':'error','msg': str(e)[:100]}), 500
+
+@app.route('/api/mqtt_status', methods=['GET'])
+def mqtt_status():
+    try:
+        subprocess.run(['systemctl','stop','mesh-collector'],capture_output=True)
+        subprocess.run(['pkill','-f','meshtastic.*listen'],capture_output=True)
+        time.sleep(2)
+        r = subprocess.run([MESHTASTIC_BIN,'--port','/dev/meshtastic','--get','mqtt'],capture_output=True,text=True,timeout=10)
+        subprocess.run(['systemctl','start','mesh-collector'],capture_output=True)
+        mqtt = 'mqtt.enabled: true' in r.stdout or 'mqtt.enabled: True' in r.stdout
+        tls = 'mqtt.tls_enabled: true' in r.stdout or 'mqtt.tls_enabled: True' in r.stdout
+        return jsonify({'mqtt': mqtt, 'tls': tls})
+    except:
+        return jsonify({'mqtt': False, 'tls': False})
+
+
+# ================== RNode Bridge API ==================
+rnode_bridge_proc = None
+rnode_bridge_clients = 0
+rnode_bridge_rx = 0
+rnode_bridge_tx = 0
+
+@app.route('/api/rnode_bridge_status', methods=['GET'])
+def rnode_bridge_status_old():
+    global rnode_bridge_proc, rnode_bridge_clients, rnode_bridge_rx, rnode_bridge_tx
+    running = rnode_bridge_proc is not None and rnode_bridge_proc.poll() is None
+    return jsonify({
+        'status': 'running' if running else 'stopped',
+        'clients': rnode_bridge_clients,
+        'rx_bytes': rnode_bridge_rx,
+        'tx_bytes': rnode_bridge_tx
+    })
+
+@app.route('/api/rnode_bridge_start', methods=['POST'])
+def rnode_bridge_start():
+    global rnode_bridge_proc, rnode_ser
+    if not check_token():
+        return jsonify({'status':'error','msg':'Access denied'}), 403
+    try:
+        # Закрываем rnode_ser чтобы освободить порт
+        if rnode_ser and rnode_ser.is_open:
+            rnode_ser.close()
+            rnode_ser = None
+        # Убиваем старый мост если есть
+        subprocess.run(['pkill', '-f', 'rnode_bridge.py'], capture_output=True)
+        time.sleep(1)
+        rnode_bridge_proc = subprocess.Popen(
+            ['/usr/local/bin/python3.10', '/home/alex/rnode_bridge.py'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        return jsonify({'status':'ok','msg':'RNode Bridge запущен (порт освобождён)'})
+    except Exception as e:
+        return jsonify({'status':'error','msg': str(e)[:80]})
+
+@app.route('/api/rnode_bridge_stop', methods=['POST'])
+def rnode_bridge_stop():
+    global rnode_bridge_proc, rnode_ser
+    if not check_token():
+        return jsonify({'status':'error','msg':'Access denied'}), 403
+    try:
+        subprocess.run(['pkill', '-f', 'rnode_bridge.py'], capture_output=True)
+        rnode_bridge_proc = None
+        time.sleep(1)
+        # Восстанавливаем rnode_reader (он сам переподключится)
+        return jsonify({'status':'ok','msg':'RNode Bridge остановлен. RNode Reader восстановится автоматически'})
+    except Exception as e:
+        return jsonify({'status':'error','msg': str(e)[:80]})
+
+@app.route('/api/rnode_bridge_status', methods=['GET'])
+def rnode_bridge_status():
+    try:
+        r = subprocess.run(['ss', '-tn', 'sport', '= :4242'], capture_output=True, text=True)
+        clients = len([l for l in r.stdout.split('\\n') if 'ESTAB' in l])
+        return jsonify({'status': 'running', 'clients': clients, 'rx_bytes': 0, 'tx_bytes': 0})
+    except:
+        return jsonify({'status': 'stopped', 'clients': 0, 'rx_bytes': 0, 'tx_bytes': 0})
+
+@app.route('/api/bridge_monitor_stream', methods=['GET'])
+def bridge_monitor_stream():
+    try:
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        sock.connect(('localhost', 4242))
+        data = b''
+        while True:
+            try:
+                chunk = sock.recv(4096)
+                if not chunk: break
+                data += chunk
+                if len(data) > 8192: break
+            except: break
+        sock.close()
+        if data:
+            try: text = data.decode('utf-8', errors='replace')
+            except: text = data.hex()
+            return jsonify({'status': 'ok', 'data': text[:5000]})
+        return jsonify({'status': 'empty', 'data': 'Нет данных'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'data': 'Ошибка: ' + str(e)[:100]})
+
 @app.route('/data')
 def get_data():
     with data_lock: return jsonify(data)
@@ -452,7 +646,8 @@ body{background:#0a0a0a;color:#e0e0e0;font-family:sans-serif;padding:10px}
 .nd{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #222;font-size:12px}
 .nd .id{color:#00c853;font-weight:600}.nd .subid{color:#666;font-size:10px;margin-left:6px}
 .bg{background:#222;padding:2px 6px;border-radius:4px;font-size:10px;margin-left:4px}
-.g{color:#4caf50}.o{color:#ff9800}.b{color:#f44336}.stale{background:#333!important;color:#777!important}
+.g{color:#4caf50}.o{color:#ff9800}.g{color:#4caf50}.o{color:#ff9800}.b{color:#f44336}.stale{background:#333!important;color:#777!important}.local{background:#0d47a1!important;color:#fff!important}padding:2px 6px;border-radius:4px;font-size:10px;margin-left:4px}
+.g{color:#4caf50}.o{color:#ff9800}.b{color:#f44336}.stale{background:#333!important;color:#777!important}.local{background:#0d47a1!important;color:#fff!important}
 .list{max-height:35vh;overflow-y:auto}
 .ifc-card{background:#1a1a1a;padding:8px;margin:6px 0;border-radius:6px;border-left:3px solid #444}
 .ifc-card.up{border-left-color:#4caf50}.ifc-card .name{font-weight:600;color:#e0e0e0;font-size:12px}
@@ -477,6 +672,11 @@ body{background:#0a0a0a;color:#e0e0e0;font-family:sans-serif;padding:10px}
 #rnodeModeBtn.mode-direct { background-color: #0d47a1 !important; color: white !important; box-shadow: 0 0 8px rgba(13, 71, 161, 0.5); }
 #rnodeModeBtn.mode-tcp { background-color: #6a1b9a !important; color: white !important; box-shadow: 0 0 8px rgba(106, 27, 154, 0.5); }
 #rnodeModeBtn:hover { opacity: 0.9; transform: scale(1.05); }
+.cbtn{background:#2c3e50;color:#fff;border:none;padding:12px;border-radius:6px;cursor:pointer;font-size:12px;transition:0.2s}
+.cbtn:hover{background:#34495e;transform:translateY(-1px)}
+.cbtn.danger{background:#c0392b}.cbtn.danger:hover{background:#e74c3c}
+.cbtn.warn{background:#d35400}.cbtn.start{background:#27ae60}.cbtn.start:hover{background:#2ecc71}
+.badge{color:#f44336;font-weight:bold;font-size:11px;display:none}
 </style>
 </head><body>
 <div class="hdr"><div class="hdr-main">
@@ -485,9 +685,14 @@ body{background:#0a0a0a;color:#e0e0e0;font-family:sans-serif;padding:10px}
 </div><div class="hdr-bot"><span id="rn_st" class="ok">● online</span> <span id="rn_pg">ping: —</span> <span id="rn_lc">check: —</span></div></div>
 <div class="flt"><button onclick="sf(0.5,this)">30м</button><button onclick="sf(1,this)">1ч</button><button onclick="sf(6,this)">6ч</button>
 <button class="a" onclick="sf(12,this)">12ч</button><button onclick="sf(24,this)">24ч</button><button onclick="sf(999,this)">Все</button></div>
-<div class="loc-bar">📟 <b id="loc_name">Loko</b> <span class="subid" id="loc_id">(!0a675cfe)</span> | ⏱ В эфире: <span id="loc_time">—</span></div>
+<div class="loc-bar">📟 <b id="loc_name">Lokomotiv</b> <span class="subid" id="loc_id">(!8fa6399c)</span> | ⏱ В эфире: <span id="loc_time">—</span></div>
 <div class="card"><h3>📡 Meshtastic Nodes <span id="nc">0</span></h3><div id="nl" class="list">—</div></div>
-<div class="card"><h3>💬 Meshtastic Chat <span id="mc">0</span></h3><div id="ml" class="list" style="padding-bottom:40px">—</div>
+<div class="card"><h3>💬 Meshtastic Chat <span id="mc">0</span></h3><div style="display:flex;justify-content:flex-end;margin:-4px 0 4px 0"><span class="reply-toggle" onclick="var e=document.getElementById('md');e.style.display=e.style.display=='none'?'block':'none';if(e.style.display=='block'){fetch('/api/mesh_info').then(function(r){return r.json()}).then(function(d){document.getElementById('md_fw').innerText=d.fw;document.getElementById('md_role').innerText=d.role;document.getElementById('md_model').innerText=d.hw;if(d.region)document.getElementById('md_region').innerText=d.region;if(d.bw)document.getElementById('md_bw').innerText=d.bw;if(d.sf)document.getElementById('md_sf').innerText=d.sf;if(d.cr)document.getElementById('md_cr').innerText=d.cr;if(d.tx)document.getElementById('md_tx').innerText=d.tx;if(d.ch)document.getElementById('md_ch').innerText=d.ch;if(d.freq)document.getElementById('md_freq').innerText=d.freq})}" style="padding:2px 6px;font-size:10px;cursor:pointer">⚙️ Детали</span></div><div id="md" style="display:none;background:#111;padding:8px;border-radius:4px;margin:0 0 8px 0;font-size:11px;color:#aaa;line-height:1.6"><b>📡 Устройство:</b> hwModel <span id="md_model">—</span> | Роль <span id="md_role">—</span> | Прошивка <span id="md_fw">—</span><br><b>📶 LoRa:</b> Регион <span id="md_region">—</span> | BW <span id="md_bw">—</span>kHz | SF <span id="md_sf">—</span> | CR <span id="md_cr">—</span> | TX <span id="md_tx">—</span>dBm | Канал <span id="md_ch">—</span> | Частота <span id="md_freq">—</span>MHz</div><div style="display:flex;gap:8px;margin-bottom:6px">
+<span id="tabAll" class="reply-toggle active" onclick="switchTab('all')" style="padding:4px 8px;font-size:10px;cursor:pointer">💬 Общий <span id="badgeAll" class="badge"></span></span>
+<span id="tabPriv" class="reply-toggle" onclick="switchTab('private')" style="padding:4px 8px;font-size:10px;cursor:pointer">📩 Личные <span id="badgePriv" class="badge"></span></span>
+<span id="tabSent" class="reply-toggle" onclick="switchTab('sent')" style="padding:4px 8px;font-size:10px;cursor:pointer">📤 Мои</span>
+</div>
+<div id="ml" class="list" style="padding-bottom:40px">—</div>
 <div class="reply-bar" id="replyBar">
 <div style="font-size:10px;color:#00c853;margin-bottom:4px;display:none" id="replyModeLabel">💬 Ответ</div>
 <div class="quote-box" id="quoteBox"></div>
@@ -513,6 +718,20 @@ body{background:#0a0a0a;color:#e0e0e0;font-family:sans-serif;padding:10px}
 <div id="rnode_msgs" class="list" style="max-height:20vh"><div style="padding:8px;color:#555">⏳ Ожидание сообщений...</div></div>
 <div style="display:flex;gap:6px;margin-top:8px"><input type="text" id="rnode_input" class="reply-input" placeholder="Сообщение для RNode..." style="flex:1">
 <button class="reply-send" onclick="sendRNode()">➤</button></div></div>
+
+<div class="card"><h3>🌉 RNode TCP Bridge <span id="bridge_status">⏳</span></h3>
+<div style="display:flex;gap:8px;margin-bottom:6px;font-size:11px;color:#aaa">
+<span>Клиентов: <b id="bridge_clients">0</b></span>
+<span>↓<b id="bridge_rx">0</b> B</span>
+<span>↑<b id="bridge_tx">0</b> B</span>
+</div>
+<div id="bridgeMonitor" style="display:none;background:#000;border:1px solid #00c853;border-radius:6px;padding:10px;margin:8px 0;max-height:250px;overflow-y:auto;font-family:monospace;font-size:11px;color:#00ff00;white-space:pre-wrap;word-break:break-all"></div>
+<div style="display:flex;gap:8px">
+<button class="cbtn start" onclick="rnodeBridgeStart()" style="font-size:10px;padding:4px 8px">▶ Запустить</button>
+<button class="cbtn danger" onclick="rnodeBridgeStop()" style="font-size:10px;padding:4px 8px">⏹ Остановить</button>
+<button id="bridgeMonitorBtn" class="cbtn" onclick="toggleBridgeMonitor()" style="font-size:10px;padding:4px 8px;background:#6a1b9a;color:#fff">🔍 Монитор</button>
+</div>
+</div>
 <div class="card"><h3>📡 RNode Nodes <span id="rnc">0</span></h3>
 <div class="flt" style="justify-content:flex-start;margin-bottom:4px">
 <button onclick="srf(1,this)" class="a" style="font-size:10px;padding:2px 6px">1ч</button>
@@ -533,6 +752,8 @@ body{background:#0a0a0a;color:#e0e0e0;font-family:sans-serif;padding:10px}
 <button class="cbtn start" onclick="restartOrStartRNodeService()">🔄▶ Restart/Start RNode</button>
 <button class="cbtn danger" onclick="stopMeshService()">⏹ Stop Mesh</button>
 <button class="cbtn danger" onclick="stopRNodeService()">⏹ Stop RNode</button>
+<button id="mqttBtn" class="cbtn" onclick="toggleMqtt()" style="background:#c0392b">MQTT OFF</button>
+<button id="tlsBtn" class="cbtn" onclick="toggleMqttTls()" style="background:#7f8c8d">TLS OFF</button>
 </div>
 <div style="margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px">
 <button class="cbtn warn" onclick="sendLocation()">📍 Send Loc</button>
@@ -540,8 +761,14 @@ body{background:#0a0a0a;color:#e0e0e0;font-family:sans-serif;padding:10px}
 </div></div>
 <script>
 const $=id=>document.getElementById(id),TOKEN="my_secret_reboot_token";
-let cf=12,currentMessages=[],reply={destId:null,isPrivate:false,quote:true,quoteText:"",quoteSender:""},rcf=12;
+let cf=parseInt(localStorage.getItem('meshFilter')||'12'),currentMessages=[],reply={destId:null,isPrivate:false,quote:true,quoteText:"",quoteSender:""},rcf=12;
 function sc(v){if(!v)return"";let n=parseInt(v);return n>-60?"g":n>-90?"o":"b"}
+setTimeout(function(){document.querySelectorAll('.flt button').forEach(function(b){if(parseInt(b.innerText.replace('ч','').replace('м','').replace('Все','999'))===cf)b.classList.add('a');})},100);
+setTimeout(function(){document.querySelectorAll('.flt button').forEach(function(b){if(parseInt(b.innerText.replace('ч','').replace('м','').replace('Все','999'))===cf)b.classList.add('a');})},100);
+setTimeout(function(){document.querySelectorAll('.flt button').forEach(function(b){if(parseInt(b.innerText.replace('ч','').replace('м','').replace('Все','999'))===cf)b.classList.add('a');})},100);
+setTimeout(function(){document.querySelectorAll(".flt button").forEach(function(b){if(parseInt(b.innerText.replace("ч","").replace("м","").replace("Все","999"))===cf)b.classList.add("a");})},100);
+setTimeout(function(){document.querySelectorAll('.flt button').forEach(function(b){let v=parseInt(b.innerText.replace('ч','').replace('м','').replace('Все','999'));if(v===cf)b.classList.add('a');})},100);
+setTimeout(function(){document.querySelectorAll('.flt button').forEach(function(b){let v=parseInt(b.innerText.replace('ч','').replace('м','').replace('Все','999'));if(v===cf)b.classList.add('a');})},100);
 function up(){fetch("/data").then(r=>r.json()).then(d=>{
 $("st").innerText=(d.status||"").includes("Online")?"🟢 Meshtastic":"⏳ Meshtastic";$("bt").innerText=d.battery||"🔋?";$("vt").innerText=d.voltage||"⚡?";
 $("wf").innerText="📶"+(d.network?d.network.wifi_ip:"—");$("rn").innerText=(d.rnode&&d.rnode.status==="online")?"🟢 RNode":"🔴 RNode";
@@ -550,11 +777,11 @@ $("rn_pg").innerText="ping: "+(d.rnode.ping||"—");$("rn_lc").innerText="check:
 let ln=d.local_node||{};$("loc_name").innerText=ln.name||"?";$("loc_id").innerText=ln.id?"(!"+ln.id+")":"";$("loc_time").innerText=ln.last_seen||"—";
 let now=Date.now()/1000,active=[],stale=[];
 for(let id in d.nodes){let i=d.nodes[id];let age=(now-i.seen_ts)/3600;if(age<0)age=0;if(cf!==999&&age>cf)continue;let entry={id:id,i:i,age:age};if(age>0.25)stale.push(entry);else active.push(entry);}
-active.sort((a,b)=>(parseInt(b.i.rssi)||-999)-(parseInt(a.i.rssi)||-999));stale.sort((a,b)=>b.age-a.age);
+active.sort(function(a,b){return b.i.seen_ts - a.i.seen_ts});stale.sort(function(a,b){return a.age - b.age});
 let nodesArr=active.concat(stale),n="",c=nodesArr.length;
 nodesArr.forEach(x=>{let i=x.i,isStale=x.age>0.25;let nameHtml=i.name?i.name+"<span class='subid'>(!"+x.id+")</span>":"!"+x.id;let rssiCls=isStale?"stale":sc(i.rssi),rssiVal=i.rssi||"-";let timeHtml=isStale?"<span style='color:#777'>⏳"+i.last_seen+"</span>":i.last_seen;let style=isStale?"opacity:0.55;":"";n+="<div class='nd' style='"+style+"'><span class='id'>"+nameHtml+"</span><span><span class='bg "+rssiCls+"'>"+rssiVal+"dB</span><span class='bg'>"+(i.snr?"SNR:"+i.snr:"")+"</span><span class='bg'>"+timeHtml+"</span></span></div>";});
 $("nc").innerText=c;$("nl").innerHTML=n||"<div style='padding:8px;color:#555'>Нет нод</div>";
-currentMessages=d.messages||[];let m="";
+currentMessages=(d.messages||[]).filter(function(m){if(chatTab==='sent'){return m.sent===true}else if(chatTab==='private'){return m.toId&&m.toId!=='^all'}else{return !m.toId||m.toId==='^all'}});let m="";
 currentMessages.forEach((x,idx)=>{m+="<div class='msg'><div class='msg-content'><span class='t'>"+x.time+"</span><span class='s'>"+x.sender+":</span>"+x.text+"</div><div style='display:flex;gap:4px'><span class='msg-act' onclick='openReply("+idx+",false)'>↩️</span><span class='msg-act' style='background:#0d47a1' onclick='openReply("+idx+",true)'>👤</span></div></div>";});
 $("mc").innerText=currentMessages.length;$("ml").innerHTML=m||"<div style='padding:8px;color:#555'>Нет сообщений</div>";
 let ns=d.rnode_nodes||[],now2=Date.now()/1000,ac=ns.filter(n=>(rcf===999||(now2-n.seen_ts)/3600<=rcf)),h2="";
@@ -562,7 +789,7 @@ ac.forEach(n=>{let rc=n.rssi==="?"?"":(parseInt(n.rssi)>-90?"g":"o");h2+="<div c
 $("rnc").innerText=ac.length;$("rnl").innerHTML=h2||"<div style='padding:8px;color:#555'>Нет узлов</div>";
 let ifcs=d.rnode_interfaces||[],tots=d.rnode_totals||{};$("rn_upd").innerText="↑"+tots.txb+" ↓"+tots.rxb;let h3="";if(ifcs.length===0)h3="<div style='padding:8px;color:#555'>Загрузка...</div>";else ifcs.forEach(i=>{h3+="<div class='ifc-card "+(i.status=="Up"?"up":"")+"'><div class='name'>"+i.name+"</div><div class='meta'>"+i.type+" | "+i.status+"</div><div class='traffic'>↑ "+i.tx+" | ↓ "+i.rx+"</div></div>";});$("rn_details").innerHTML=h3;
 })}
-function sf(h,btn){cf=h;document.querySelectorAll(".flt button").forEach(b=>b.classList.remove("a"));if(btn)btn.classList.add("a");up();}
+function sf(h,btn){cf=h;localStorage.setItem('meshFilter',h);localStorage.setItem('meshFilter',h);localStorage.setItem('meshFilter',h);document.querySelectorAll(".flt button").forEach(b=>b.classList.remove("a"));if(btn)btn.classList.add("a");up();}
 function srf(h,b){rcf=h;document.querySelectorAll(".flt button").forEach(x=>x.classList.remove("a"));if(b)b.classList.add("a");up();}
 function openReply(idx,isPrivate){if(!currentMessages[idx])return;let msg=currentMessages[idx];reply={destId:msg.sender_id,isPrivate:isPrivate,quote:!isPrivate,quoteText:msg.text,quoteSender:msg.sender};$("replyModeLabel").style.display="block";$("replyModeLabel").innerText=isPrivate?"📩 Личное: "+msg.sender:"💬 В общий чат";if(reply.quote){let t=msg.text.length>60?msg.text.substring(0,60)+"...":msg.text;$("quoteBox").innerText="> "+msg.sender+": "+t;$("quoteBox").style.display="block";$("quoteToggle").classList.add("active")}else{$("quoteBox").style.display="none";$("quoteToggle").classList.remove("active")}$("replyBar").classList.add("active");$("replyInput").value="";$("replyInput").focus()}
 function toggleQuote(){reply.quote=!reply.quote;if(reply.quote&&reply.quoteText){$("quoteBox").style.display="block";$("quoteToggle").classList.add("active")}else{$("quoteBox").style.display="none";$("quoteToggle").classList.remove("active")}}
@@ -610,6 +837,144 @@ else{btn.innerText="🌐 TCP";btn.classList.add("mode-tcp")}
 });
 }
 setTimeout(loadRNodeMode,500);
+function restartRNodePort(){if(!confirm("Restart RNode port?"))return;fetch("/api/restart_rnode_port?token="+TOKEN,{method:"POST"}).then(r=>r.json()).then(d=>{alert(d.msg);setTimeout(()=>location.reload(),2000)})}
+function stopRNodePort(){if(!confirm("Close RNode port?"))return;fetch("/api/stop_rnode_port?token="+TOKEN,{method:"POST"}).then(r=>r.json()).then(d=>alert(d.msg))}
+function restartOrStartMesh(){if(!confirm("Restart/Start Mesh?"))return;fetch("/api/restart_or_start_mesh_service?token="+TOKEN,{method:"POST"}).then(r=>r.json()).then(d=>alert(d.msg))}
+function stopMeshProcess(){if(!confirm("Stop Mesh process?"))return;fetch("/api/stop_mesh_process?token="+TOKEN,{method:"POST"}).then(r=>r.json()).then(d=>alert(d.msg))}
+function rebootMeshtastic(){if(!confirm("Restart Mesh device?"))return;fetch("/api/meshcmd?action=reboot&token="+TOKEN,{method:"POST"}).then(r=>r.json()).then(d=>alert(d.msg))}
+function poweroffMeshtastic(){if(!confirm("Stop Mesh device?"))return;fetch("/api/meshcmd?action=shutdown&token="+TOKEN,{method:"POST"}).then(r=>r.json()).then(d=>alert(d.msg))}
+function toggleMqtt(){if(!confirm("Переключить MQTT?"))return;var b=document.getElementById("mqttBtn");b.innerText="...";b.disabled=true;fetch("/api/toggle_mqtt?token="+TOKEN,{method:"POST"}).then(function(r){return r.json()}).then(function(d){if(d.mqtt){b.innerText="MQTT ON";b.style.background="#27ae60"}else{b.innerText="MQTT OFF";b.style.background="#c0392b"}b.disabled=false})}
+function toggleMqttTls(){if(!confirm("Переключить TLS?"))return;var b=document.getElementById("tlsBtn");b.innerText="...";b.disabled=true;fetch("/api/toggle_mqtt_tls?token="+TOKEN,{method:"POST"}).then(function(r){return r.json()}).then(function(d){if(d.tls){b.innerText="TLS ON";b.style.background="#f39c12"}else{b.innerText="TLS OFF";b.style.background="#7f8c8d"}b.disabled=false})}
+fetch("/api/mqtt_status").then(function(r){return r.json()}).then(function(d){var mb=document.getElementById("mqttBtn"),tb=document.getElementById("tlsBtn");if(d.mqtt){mb.innerText="MQTT ON";mb.style.background="#27ae60"}else{mb.innerText="MQTT OFF";mb.style.background="#c0392b"}if(d.tls){tb.innerText="TLS ON";tb.style.background="#f39c12"}else{tb.innerText="TLS OFF";tb.style.background="#7f8c8d"}});
+let chatTab='all';
+var lastMsgKeys = {};
+var newAllCount = 0, newPrivCount = 0;
+var firstRun = true;
+setInterval(function(){
+    fetch('/data').then(function(r){return r.json()}).then(function(d){
+        var msgs = d.messages || [];
+        var currentKeys = {};
+        msgs.forEach(function(m){
+            if(m.sent) return;
+            var key = m.time + '|' + m.sender + '|' + m.text.substring(0,30);
+            currentKeys[key] = true;
+            if(!firstRun && !lastMsgKeys[key]){
+                if(!m.toId||m.toId==='^all') newAllCount++;
+                else newPrivCount++;
+            }
+        });
+        if(firstRun){ firstRun = false; lastMsgKeys = currentKeys; return; }
+        lastMsgKeys = currentKeys;
+        if(chatTab==='all'){ newAllCount=0; document.getElementById('badgeAll').style.display='none'; }
+        if(chatTab==='private'){ newPrivCount=0; document.getElementById('badgePriv').style.display='none'; }
+        if(newAllCount>0 && chatTab!=='all'){
+            document.getElementById('badgeAll').innerText='+'+newAllCount;
+            document.getElementById('badgeAll').style.display='inline';
+        }
+        if(newPrivCount>0 && chatTab!=='private'){
+            document.getElementById('badgePriv').innerText='+'+newPrivCount;
+            document.getElementById('badgePriv').style.display='inline';
+        }
+    });
+},3000);
+
+function switchTab(t){chatTab=t;newAllCount=0;newPrivCount=0;firstRun=true;lastMsgKeys={};document.getElementById('badgeAll').style.display='none';document.getElementById('badgePriv').style.display='none';
+    document.getElementById('badgeAll').style.display='none';
+    document.getElementById('badgePriv').style.display='none';['tabAll','tabPriv','tabSent'].forEach(function(id){document.getElementById(id).classList.remove('active')});var activeId=t==='all'?'tabAll':t==='private'?'tabPriv':'tabSent';document.getElementById(activeId).classList.add('active');up();}let bridgeMonitorActive = false;
+let bridgeMonitorInterval = null;
+
+function toggleBridgeMonitor(){
+    var btn = document.getElementById('bridgeMonitorBtn');
+    var monitor = document.getElementById('bridgeMonitor');
+    if(bridgeMonitorActive){
+        bridgeMonitorActive = false;
+        if(bridgeMonitorInterval) clearInterval(bridgeMonitorInterval);
+        monitor.style.display = 'none';
+        btn.style.background = '#6a1b9a';
+        btn.innerHTML = '🔍 Монитор';
+        btn.style.color = '#fff';
+    } else {
+        bridgeMonitorActive = true;
+        monitor.style.display = 'block';
+        monitor.innerHTML = '<span style=color:#888>▶ Монитор запущен. Ожидание данных...</span>';
+        monitor.removeAttribute('data-content');
+        btn.style.background = '#00c853';
+        btn.innerHTML = '⏹ Стоп';
+        btn.style.color = '#000';
+        fetchBridgeMonitorData();
+        bridgeMonitorInterval = setInterval(fetchBridgeMonitorData, 2000);
+    }
+}
+
+function fetchBridgeMonitorData(){
+    if(!bridgeMonitorActive) return;
+    fetch('/api/bridge_monitor_stream').then(function(r){return r.json()}).then(function(d){
+        var m = document.getElementById('bridgeMonitor');
+        var now = new Date().toLocaleTimeString();
+        if(d.status === 'ok' && d.data && d.data !== 'Пусто'){
+            var newLine = '[' + now + '] ' + d.data;
+            var current = m.getAttribute('data-content') || '';
+            if(current){
+                m.innerHTML = current + '<br>' + newLine;
+            } else {
+                m.innerHTML = newLine;
+            }
+            m.setAttribute('data-content', m.innerHTML);
+            var lines = m.innerHTML.split('\\n');
+            if(lines.length > 100){
+                m.innerHTML = lines.slice(-100).join('\\n');
+                m.setAttribute('data-content', m.innerHTML);
+            }
+        } else if(d.status === 'error'){
+            var current = m.getAttribute('data-content') || '';
+            var errLine = '[' + now + '] ⚠ ' + d.data;
+            if(current){
+                m.innerHTML = current + '<br>' + errLine;
+            } else {
+                m.innerHTML = errLine;
+            }
+            m.setAttribute('data-content', m.innerHTML);
+        }
+        m.scrollTop = m.scrollHeight;
+    }).catch(function(e){
+        var m = document.getElementById('bridgeMonitor');
+        var current = m.getAttribute('data-content') || '';
+        var errLine = '[' + new Date().toLocaleTimeString() + '] ❌ Ошибка запроса';
+        if(current){
+            m.innerHTML = current + '<br>' + errLine;
+        } else {
+            m.innerHTML = errLine;
+        }
+        m.setAttribute('data-content', m.innerHTML);
+        m.scrollTop = m.scrollHeight;
+    });
+}
+
+function rnodeBridgeStart(){
+    fetch('/api/rnode_bridge_start?token='+TOKEN,{method:'POST'}).then(r=>r.json()).then(d=>alert(d.msg));
+    setTimeout(updateBridgeStatus,1000);
+}
+function rnodeBridgeStop(){
+    fetch('/api/rnode_bridge_stop?token='+TOKEN,{method:'POST'}).then(r=>r.json()).then(d=>alert(d.msg));
+    setTimeout(updateBridgeStatus,1000);
+}
+function updateBridgeStatus(){
+    fetch('/api/rnode_bridge_status').then(r=>r.json()).then(d=>{
+        document.getElementById('bridge_status').innerText = d.status==='running'?'🟢 Активен':'🔴 Остановлен';
+        document.getElementById('bridge_clients').innerText = d.clients;
+        document.getElementById('bridge_rx').innerText = d.rx_bytes;
+        document.getElementById('bridge_tx').innerText = d.tx_bytes;
+    });
+}
+updateBridgeStatus();
+function updateClients(){
+    fetch('/api/bridge_clients').then(function(r){return r.json()}).then(function(d){
+        document.getElementById('bridge_clients').innerText = d.clients;
+    });
+}
+updateClients();
+setInterval(updateClients, 5000);
+setInterval(updateBridgeStatus, 5000);
 setInterval(up,3000);up();
 </script></body></html>'''
 
@@ -632,7 +997,7 @@ def preload_node_names():
                         name = name_m.group(1)
                         with data_lock:
                             if fid not in data['nodes']:
-                                data['nodes'][fid] = {'last_seen': '—', 'name': name, 'rssi': '', 'snr': '', 'seen_ts': time.time()}
+                                data['nodes'][fid] = {'last_seen': '—', 'name': name, 'rssi': '', 'snr': '', 'seen_ts': 0}
                             else:
                                 data['nodes'][fid]['name'] = name
                         count += 1
@@ -640,7 +1005,34 @@ def preload_node_names():
     except Exception as e:
         print(f"❌ Ошибка загрузки: {e}")
 
+@app.route('/api/bridge_clients')
+def bridge_clients():
+    import subprocess
+    try:
+        r = subprocess.run(['ss', '-tn', 'sport', '= :4242'],
+                          capture_output=True, text=True)
+        clients = len([l for l in r.stdout.split('\\n') if 'ESTAB' in l])
+        return jsonify({'clients': clients})
+    except:
+        return jsonify({'clients': 0})
+
 if __name__=='__main__':
+    if not os.path.exists('/dev/meshtastic'):
+        os.system('ln -sf /dev/ttyACM0 /dev/meshtastic')
+        print('Создан симлинк /dev/meshtastic')
+
+    if not os.path.exists('/dev/meshtastic'):
+        os.system('ln -sf /dev/ttyACM0 /dev/meshtastic')
+        print('Создан симлинк /dev/meshtastic')
+
+    if not os.path.exists('/dev/meshtastic'):
+        os.system('ln -sf /dev/ttyACM0 /dev/meshtastic')
+        print('Создан симлинк /dev/meshtastic')
+
+    if not os.path.exists('/dev/meshtastic'):
+        os.system('ln -sf /dev/ttyACM0 /dev/meshtastic')
+        print('Создан симлинк /dev/meshtastic')
+
     preload_node_names()
     threading.Thread(target=reader_loop, daemon=True).start()
     threading.Thread(target=rnode_reader_loop, daemon=True).start()
